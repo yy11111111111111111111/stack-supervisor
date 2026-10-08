@@ -899,17 +899,33 @@ function Start-ServiceProcess {
 }
 
 function Get-ServiceProcessSnapshot {
-    <# Separates same-name processes from the unique instance identified by its config path. #>
+    <#
+        Separates same-name processes from the unique instance identified by its config path. Reason says in
+        words why the answer is what it is: the supervisor runs hidden, and 'ambiguous' alone does not tell an
+        operator what to fix.
+    #>
     param([Parameter(Mandatory)]$Config)
     $name = [System.IO.Path]::GetFileName([string]$Config.service.processName)
     if ([System.IO.Path]::GetExtension($name) -eq '') { $name += '.exe' }
     $filter = "Name='" + $name.Replace("'", "''") + "'"
     $processes = @(Get-CimInstance -ClassName Win32_Process -Filter $filter -ErrorAction Stop)
-    $configPath = [System.IO.Path]::GetFullPath([string]$Config.service.configPath)
+    # Both sides use backslashes, so the comparison does not depend on how either path was written.
+    $configPath = [System.IO.Path]::GetFullPath([string]$Config.service.configPath).Replace('/', '\')
     $matching = @($processes | Where-Object {
         $_.CommandLine -and ([string]$_.CommandLine).Replace('/', '\').IndexOf($configPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
     })
-    return [pscustomobject]@{ Processes = $processes; Matching = $matching }
+    if ($processes.Count -eq 0) {
+        $reason = "no process named $name is running"
+    } elseif ($matching.Count -eq 1) {
+        $reason = "exactly one $name process carries $configPath in its command line"
+    } elseif ($matching.Count -gt 1) {
+        $reason = "$($matching.Count) $name processes carry $configPath in their command lines"
+    } else {
+        $reason = "$($processes.Count) $name process(es) are running but none carries $configPath in its command line; start the service with the absolute configPath"
+        $unreadable = @($processes | Where-Object { -not $_.CommandLine }).Count
+        if ($unreadable -gt 0) { $reason += " ($unreadable command line(s) could not be read; the supervisor may lack the rights to see them)" }
+    }
+    return [pscustomobject]@{ Processes = $processes; Matching = $matching; Reason = $reason }
 }
 
 function Get-ServiceProcessCandidates {
@@ -1130,7 +1146,7 @@ while ($true) {
         continue
     }
     if ($serviceState.Matching.Count -gt 1 -or ($serviceState.Processes.Count -gt 0 -and $serviceState.Matching.Count -eq 0)) {
-        Write-Log -Message 'service executable is present but its configured instance is ambiguous; deferring recovery' -Path $logPath
+        Write-Log -Message ('service executable is present but its configured instance is ambiguous; deferring recovery: ' + $serviceState.Reason) -Path $logPath
         $missing = 0; $failures = 0; $degraded = 0
         if ($Once) { break }
         Start-Sleep -Seconds $CheckIntervalSec
@@ -1153,7 +1169,7 @@ while ($true) {
                 Write-Log -Message 'service started by the supervisor' -Path $logPath
                 $missing = 0
             } elseif ($startedState -and ($startedState.Matching.Count -gt 1 -or $startedState.Processes.Count -gt 0)) {
-                Write-Log -Message 'service start is ambiguous; deferring further recovery' -Path $logPath
+                Write-Log -Message ('service start is ambiguous; deferring further recovery: ' + $startedState.Reason) -Path $logPath
                 $missing = 0
             }
         }

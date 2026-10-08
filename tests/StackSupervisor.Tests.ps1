@@ -20,6 +20,11 @@ BeforeAll {
             . ([scriptblock]::Create($functionAst.Extent.Text))
         }
     }
+    if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+        # Lets Pester mock the cmdlet on hosts that do not ship the CIM module; the tests never query real WMI.
+        function Get-CimInstance { [CmdletBinding()] param([string]$ClassName, [string]$Filter) }
+    }
+
     function New-TestPatchRule {
         param([string]$Path, [string]$Value)
         return [pscustomobject]@{ path = $Path; value = $Value }
@@ -202,10 +207,12 @@ Describe 'Health scoring and failover decisions' {
 Describe 'Service process identity' {
     It 'matches the config path so another process with the same executable is ignored' {
         $config = New-TestConfig
-        $config.service.configPath = 'C:\ProgramData\edge-gateway\gateway.json'
+        $livePath = [System.IO.Path]::GetFullPath((Join-Path $TestDrive 'gateway.json'))
+        $otherPath = [System.IO.Path]::GetFullPath((Join-Path $TestDrive 'other/gateway.json'))
+        $config.service.configPath = $livePath
         $script:processFixtures = @(
-            [pscustomobject]@{ ProcessId = 11; CommandLine = 'edge-gateway.exe --config "C:\ProgramData\edge-gateway\gateway.json"' },
-            [pscustomobject]@{ ProcessId = 22; CommandLine = 'edge-gateway.exe --config "C:\Other\gateway.json"' }
+            [pscustomobject]@{ ProcessId = 11; CommandLine = ('edge-gateway.exe --config "{0}"' -f $livePath) },
+            [pscustomobject]@{ ProcessId = 22; CommandLine = ('edge-gateway.exe --config "{0}"' -f $otherPath) }
         )
         Mock Get-CimInstance { return $script:processFixtures }
 
@@ -656,5 +663,90 @@ Describe 'JSON syntax accepted and rejected by the tokenizer' {
         @{ Name = 'a duplicated property name'; Json = '{"a":1,"a":2}' }
     ) {
         { Get-JsonDocumentTree -Text $Json } | Should -Throw
+    }
+}
+
+Describe 'Service process identity: the reason is spelled out' {
+    BeforeAll {
+        $script:identityPath = [System.IO.Path]::GetFullPath((Join-Path $TestDrive 'gateway.json'))
+        $script:identityOther = [System.IO.Path]::GetFullPath((Join-Path $TestDrive 'other/gateway.json'))
+        function New-IdentityConfig {
+            $config = New-TestConfig
+            $config.service.configPath = $script:identityPath
+            return $config
+        }
+    }
+
+    It 'says that no process of the executable is running' {
+        $script:processFixtures = @()
+        Mock Get-CimInstance { return $script:processFixtures }
+
+        $snapshot = Get-ServiceProcessSnapshot -Config (New-IdentityConfig)
+
+        $snapshot.Processes.Count | Should -Be 0
+        $snapshot.Matching.Count | Should -Be 0
+        $snapshot.Reason | Should -BeExactly 'no process named edge-gateway.exe is running'
+    }
+
+    It 'identifies the one process that carries the config path' {
+        $script:processFixtures = @(
+            [pscustomobject]@{ ProcessId = 11; CommandLine = ('edge-gateway.exe --config "{0}"' -f $script:identityPath) },
+            [pscustomobject]@{ ProcessId = 22; CommandLine = ('edge-gateway.exe --config "{0}"' -f $script:identityOther) }
+        )
+        Mock Get-CimInstance { return $script:processFixtures }
+
+        $snapshot = Get-ServiceProcessSnapshot -Config (New-IdentityConfig)
+
+        $snapshot.Processes.Count | Should -Be 2
+        @($snapshot.Matching).Count | Should -Be 1
+        $snapshot.Matching[0].ProcessId | Should -Be 11
+        $snapshot.Reason | Should -BeLike 'exactly one edge-gateway.exe process carries *'
+    }
+
+    It 'compares paths regardless of the slash direction used on the command line' {
+        $script:processFixtures = @(
+            [pscustomobject]@{ ProcessId = 11; CommandLine = ('edge-gateway.exe --config "{0}"' -f $script:identityPath.Replace('\', '/')) }
+        )
+        Mock Get-CimInstance { return $script:processFixtures }
+
+        @((Get-ServiceProcessSnapshot -Config (New-IdentityConfig)).Matching).Count | Should -Be 1
+    }
+
+    It 'reports several matching processes' {
+        $script:processFixtures = @(
+            [pscustomobject]@{ ProcessId = 11; CommandLine = ('edge-gateway.exe --config "{0}"' -f $script:identityPath) },
+            [pscustomobject]@{ ProcessId = 22; CommandLine = ('edge-gateway.exe -c {0}' -f $script:identityPath) }
+        )
+        Mock Get-CimInstance { return $script:processFixtures }
+
+        $snapshot = Get-ServiceProcessSnapshot -Config (New-IdentityConfig)
+
+        @($snapshot.Matching).Count | Should -Be 2
+        $snapshot.Reason | Should -BeLike '2 edge-gateway.exe processes carry *'
+    }
+
+    It 'explains that none of the running processes carries the config path' {
+        $script:processFixtures = @(
+            [pscustomobject]@{ ProcessId = 11; CommandLine = 'edge-gateway.exe --config gateway.json' }
+        )
+        Mock Get-CimInstance { return $script:processFixtures }
+
+        $snapshot = Get-ServiceProcessSnapshot -Config (New-IdentityConfig)
+
+        @($snapshot.Matching).Count | Should -Be 0
+        $snapshot.Reason | Should -BeLike '1 edge-gateway.exe process(es) are running but none carries *in its command line*absolute configPath*'
+        $snapshot.Reason | Should -Not -BeLike '*could not be read*'
+    }
+
+    It 'points at unreadable command lines when a running process hides its own' {
+        $script:processFixtures = @(
+            [pscustomobject]@{ ProcessId = 11; CommandLine = $null }
+        )
+        Mock Get-CimInstance { return $script:processFixtures }
+
+        $snapshot = Get-ServiceProcessSnapshot -Config (New-IdentityConfig)
+
+        @($snapshot.Matching).Count | Should -Be 0
+        $snapshot.Reason | Should -BeLike '*1 command line(s) could not be read*'
     }
 }
