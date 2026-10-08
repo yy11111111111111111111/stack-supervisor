@@ -945,6 +945,23 @@ function Test-UpstreamReachability {
     return $false
 }
 
+function Restore-ConfigBytes {
+    <# Puts back the exact bytes that were read before the first write of a failover attempt. #>
+    param([Parameter(Mandatory)]$Config, $Bytes)
+    if ($null -eq $Bytes) {
+        Write-Log -Message 'no copy of the previous configuration is available to restore' -Path $Config.log
+        return $false
+    }
+    try {
+        [System.IO.File]::WriteAllBytes([string]$Config.service.configPath, [byte[]]$Bytes)
+        Write-Log -Message 'previous configuration restored' -Path $Config.log
+        return $true
+    } catch {
+        Write-Log -Message ('could not restore the previous configuration: ' + $_.Exception.Message) -Path $Config.log
+        return $false
+    }
+}
+
 function Invoke-Failover {
     param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$Reason, [int]$CurrentScore = 0, [switch]$Force, [switch]$DryRun)
     $active = Get-ActiveEndpoint -Config $Config
@@ -978,12 +995,22 @@ function Invoke-Failover {
         $healthy = $better
     }
 
+    $originalBytes = $null
     foreach ($entry in $healthy) {
         $endpoint = $entry.Endpoint
         Write-Log -Message ('trying {0} {1}:{2} (probe score {3})' -f $endpoint.Label, $endpoint.Host, $endpoint.Port, $entry.Score) -Path $Config.log
         if ($DryRun) { Write-Log -Message 'dry run: configuration left untouched' -Path $Config.log; return $true }
+        if ($null -eq $originalBytes) {
+            try { $originalBytes = [System.IO.File]::ReadAllBytes([string]$Config.service.configPath) } catch { $originalBytes = $null }
+        }
         if (-not (Set-ActiveEndpoint -Config $Config -Endpoint $endpoint)) { continue }
-        Restart-ServiceProcess -Config $Config | Out-Null
+        if (-not (Restart-ServiceProcess -Config $Config)) {
+            # The file has changed but the service did not follow. Scoring now would measure the old process and could
+            # report a switch that never took effect, so put the file back and let a later round decide again.
+            Write-Log -Message 'the service did not restart; restoring the previous configuration so the file matches the running process' -Path $Config.log
+            Restore-ConfigBytes -Config $Config -Bytes $originalBytes | Out-Null
+            return $false
+        }
         $score = Get-GatewayScore -Config $Config
         if ($score -ge 1) {
             Write-Log -Message ('switch complete: {0} {1}:{2} is serving (score {3})' -f $endpoint.Label, $endpoint.Host, $endpoint.Port, $score) -Path $Config.log

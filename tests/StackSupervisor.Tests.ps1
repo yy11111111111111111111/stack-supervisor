@@ -390,3 +390,81 @@ Describe 'Optional attribute patch rules' {
         { Update-EndpointBlock -Config $config -BlockText $blockText -Endpoint $script:plainEndpoint } | Should -Throw '*duplicate patch path*'
     }
 }
+
+Describe 'Failover when the service restart does not complete' {
+    BeforeAll {
+        function Initialize-FailoverScenario {
+            param([string]$Name, [object[]]$Candidates)
+            $script:failoverPath = Join-Path $TestDrive ($Name + '.json')
+            $script:failoverOriginal = [byte[]](0xEF, 0xBB, 0xBF) + [System.Text.Encoding]::UTF8.GetBytes("{`"original`":true}`r`n")
+            [System.IO.File]::WriteAllBytes($script:failoverPath, $script:failoverOriginal)
+            $script:failoverCandidates = $Candidates
+            $script:failoverConfig = New-TestConfig
+            $script:failoverConfig.service.configPath = $script:failoverPath
+            $script:restartCalls = 0
+            $script:scoreCalls = 0
+            Mock Get-ActiveEndpoint { return [pscustomobject]@{ Host = 'active.example'; Port = 443 } }
+            Mock Test-UpstreamReachability { return $true }
+            Mock Get-CatalogEndpoints { return $script:failoverCandidates }
+            Mock Invoke-CandidateMeasurement {
+                return @($script:failoverCandidates | ForEach-Object { [pscustomobject]@{ Endpoint = $_; Score = 2; Ms = 10 } })
+            }
+            Mock Set-ActiveEndpoint {
+                [System.IO.File]::WriteAllText($script:failoverPath, ('{"patched":"' + $Endpoint.Host + '"}'))
+                return $true
+            }
+            Mock Write-Log {}
+        }
+
+        function New-TestCandidate {
+            param([string]$Name)
+            return [pscustomobject]@{ Label = $Name; Host = ($Name + '.example'); Port = 8443; Fields = @{ host = ($Name + '.example'); port = 8443 } }
+        }
+    }
+
+    It 'puts the previous configuration back and reports failure instead of scoring the old process' {
+        Initialize-FailoverScenario -Name 'refused' -Candidates @((New-TestCandidate 'c1'))
+        Mock Restart-ServiceProcess { return $false }
+        Mock Get-GatewayScore { return 1 }
+
+        Invoke-Failover -Config $script:failoverConfig -Reason 'test' -CurrentScore 1 | Should -BeFalse
+
+        [System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($script:failoverPath)) | Should -BeExactly ([System.BitConverter]::ToString($script:failoverOriginal))
+        Should -Invoke Get-GatewayScore -Times 0 -Exactly
+        Should -Invoke Write-Log -ParameterFilter { $Message -like '*did not restart*restoring the previous configuration*' }
+    }
+
+    It 'restores the configuration from before the first write when a later candidate is the one that fails to restart' {
+        Initialize-FailoverScenario -Name 'second' -Candidates @((New-TestCandidate 'c1'), (New-TestCandidate 'c2'))
+        Mock Restart-ServiceProcess { $script:restartCalls++; return ($script:restartCalls -eq 1) }
+        Mock Get-GatewayScore { return 0 }
+
+        Invoke-Failover -Config $script:failoverConfig -Reason 'test' -CurrentScore 0 | Should -BeFalse
+
+        Should -Invoke Set-ActiveEndpoint -Times 2 -Exactly
+        [System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($script:failoverPath)) | Should -BeExactly ([System.BitConverter]::ToString($script:failoverOriginal))
+    }
+
+    It 'keeps the new configuration and reports success when the restart completes and the data path answers' {
+        Initialize-FailoverScenario -Name 'success' -Candidates @((New-TestCandidate 'c1'))
+        Mock Restart-ServiceProcess { return $true }
+        Mock Get-GatewayScore { return 2 }
+
+        Invoke-Failover -Config $script:failoverConfig -Reason 'test' -CurrentScore 1 | Should -BeTrue
+
+        [System.IO.File]::ReadAllText($script:failoverPath) | Should -BeExactly '{"patched":"c1.example"}'
+        Should -Invoke Restart-ServiceProcess -Times 1 -Exactly
+        Should -Invoke Get-GatewayScore -Times 1 -Exactly
+    }
+
+    It 'moves on to the next candidate when a completed restart is not followed by a working data path' {
+        Initialize-FailoverScenario -Name 'verify' -Candidates @((New-TestCandidate 'c1'), (New-TestCandidate 'c2'))
+        Mock Restart-ServiceProcess { return $true }
+        Mock Get-GatewayScore { $script:scoreCalls++; if ($script:scoreCalls -eq 1) { return 0 } return 2 }
+
+        Invoke-Failover -Config $script:failoverConfig -Reason 'test' -CurrentScore 0 | Should -BeTrue
+
+        [System.IO.File]::ReadAllText($script:failoverPath) | Should -BeExactly '{"patched":"c2.example"}'
+        Should -Invoke Restart-ServiceProcess -Times 2 -Exactly
+    }
+}
