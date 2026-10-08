@@ -83,31 +83,75 @@ worst true latency in the candidate set.
 
 ## Configuration patching
 
-The live configuration is treated as text, not as a serialised object graph:
+The live configuration is edited as text, through source spans, not re-serialised from an
+object graph:
 
-1. Locate the object that carries the configured tag **and** a sibling property from
-   `RequireProperty` (default `protocol`).
-2. Rewrite only the fields that describe the endpoint.
-3. Re-parse the whole file and read the changed fields back.
-4. Back up the previous file, then write.
+1. A strict JSON tokenizer reads the whole file and records where every value starts and
+   ends. It accepts JSON as RFC 8259 defines it and nothing else: comments, trailing commas
+   and duplicate property names (anywhere in the file) are errors, not things to skip.
+2. Locate the one object that carries the configured tag **and** every property from
+   `requireProperties`. Zero or several matches refuse the write.
+3. Apply `patchRules`. A `path`/`value` rule replaces exactly one scalar value, identified by
+   its path inside that object, with the expanded template (strings are JSON-escaped,
+   numbers and booleans are validated). Legacy `pattern`/`replacement` rules are still
+   accepted, but each pattern must match exactly once inside the object. A rule that uses
+   `{attr:name}` is switched off for a candidate without that attribute; only a rule that
+   will write needs its path to exist.
+4. Parse the patched file again, find the same object through the same JSON pointer, read
+   host and port back from it, and compare them with the endpoint that was requested.
+5. Back up the previous file, then write.
 
-Step 1 is the important one. A configuration often mentions the endpoint tag in more than
+Step 2 is the important one. A configuration often mentions the endpoint tag in more than
 one place - for example a forwarder object that contains a nested reference to the
 endpoint's tag. Scanning for the first occurrence of the tag finds that nested reference
 and rewrites the wrong object, silently disabling failover while every log line still
 claims success. Requiring a sibling property (which a reference does not have) is what
 makes the search unambiguous.
 
-Text patching is chosen over parse/serialise because it preserves formatting, ordering and
-comments, which keeps diffs reviewable and avoids surprises with duplicate keys.
+Why spans instead of parse-and-reserialise: re-serialising rewrites the whole file in the
+serialiser's own layout and loses whatever the parser does not model, so diffs stop being
+reviewable. Spans keep every byte outside the replaced values. The price is strictness.
+Because the tokenizer has to know exactly where every value is, a file with comments or
+other extensions cannot be edited this way and is refused rather than patched on a best
+guess. Every refusal carries its reason to the log (syntax error with line and column,
+"no object has tag ...", or the paths of an ambiguous match), because the supervisor runs
+hidden and the log is the only diagnostic.
+
+## Process identity
+
+"Which process is the service" decides what gets stopped, so it is answered by two facts
+together: the executable name (`processName`) and the absolute `configPath` appearing in
+the process command line (`Win32_Process.CommandLine`, compared case-insensitively, with
+`/` and `\` treated alike).
+
+| Processes with that name | Carrying the config path | Result |
+|---|---|---|
+| none | - | the service is missing: the keeper acts first, the supervisor after `missingThreshold` rounds |
+| any | exactly one | that process is the service; only it can be stopped |
+| any | several | refuse: recovery is deferred and nothing is stopped |
+| some | none, or the command lines are unreadable | refuse: recovery is deferred and nothing is stopped |
+
+Stopping by name alone would stop a second instance of the same executable too, which is
+why the path is part of the identity. The cost is that the rule fails closed: if the
+service is started without its absolute config path (a relative `--config`, an environment
+variable), or the supervisor is not allowed to read the command line, it neither scores
+health nor fails over, and logs the reason every round.
+
+A restart that cannot be carried out is a failed switch. The configuration written for it
+is put back byte for byte, so the file never describes a state the running service did not
+load, and no cooldown is consumed by a switch that did not happen.
+
+The keeper does not use this rule yet: it detects the service by process name
+(`detect.kind: process`), and its `commandLine` detection only inspects `powershell.exe`.
+See LIMITATIONS.md.
 
 ## Keep-alive ownership
 
 Mutual supervision between processes breaks down exactly when it matters: a cleanup tool,
 a session logoff, or a process-tree kill can remove every supervisor at once. The keeper
 therefore relies on the OS scheduler, which owns the process independently of any session,
-and it detects components by command line rather than by process name so it can tell two
-supervisors apart.
+and it can detect a component by command line rather than by process name, which is how it
+tells two supervisors apart.
 
 Detection patterns must exclude the detecting process itself. A check whose own command
 line embeds the pattern it searches for will match itself and report a healthy stack that
@@ -123,6 +167,10 @@ does not exist.
 | Every candidate bad | L2 candidate stage | keep the current configuration, retry next round |
 | Local network down | L2 reachability pre-check | do nothing; the fault is local |
 | Configuration write race | backup + read-back validation | refuse the write |
+| Configuration cannot be read unambiguously (syntax error, no match, several matches, missing path) | `Get-JsonObjectBlock`, patch validation | refuse the write, log the reason |
+| Service restart refused or incomplete after a write | `Restart-ServiceProcess` result | restore the previous configuration, end the attempt |
+| Service cannot be identified (none or several carry the config path, unreadable command lines) | `Get-ServiceProcessSnapshot` | defer recovery, log the reason |
+| Failover attempt raises an unexpected error | `Invoke-FailoverGuarded` | log it; the next round decides again |
 | All supervisors killed | L4 scheduled task | start whatever is missing |
 | Machine reboot | startup items + L4 | normal cold start |
 
