@@ -559,15 +559,17 @@ function Update-EndpointBlock {
         if ($pathProperty -and $valueProperty) {
             $path = [string]$pathProperty.Value
             if (-not $usedPaths.Add($path)) { throw ('duplicate patch path: ' + $path) }
-            $node = Get-JsonPathNode -Node $tree -Path $path
-            if (-not $node) { throw ('patch path does not exist: ' + $path) }
-            if ($node.Kind -notin @('String', 'Number', 'Boolean')) { throw ('patch path is not a scalar value: ' + $path) }
             $template = [string]$valueProperty.Value
             $skip = $false
             foreach ($match in [regex]::Matches($template, '\{attr:([^\}]+)\}')) {
                 if (-not $tokens.ContainsKey('attr:' + $match.Groups[1].Value)) { $skip = $true; break }
             }
+            # An optional attribute the candidate does not carry switches the rule off, exactly as it does for
+            # legacy rules. Only a rule that is going to write needs its path to exist.
             if ($skip) { continue }
+            $node = Get-JsonPathNode -Node $tree -Path $path
+            if (-not $node) { throw ('patch path does not exist: ' + $path) }
+            if ($node.Kind -notin @('String', 'Number', 'Boolean')) { throw ('patch path is not a scalar value: ' + $path) }
             $value = Expand-Template -Template $template -Tokens $tokens
             if ($node.Kind -eq 'String') {
                 $rawValue = [string](ConvertTo-Json -InputObject ([string]$value) -Compress -Depth 100)

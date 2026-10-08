@@ -340,3 +340,53 @@ Describe 'A failed failover attempt must not end the supervisor' {
         Should -Invoke Write-Log -ParameterFilter { $Message -like '*cannot build a probe instance*tls.serverName*' }
     }
 }
+
+Describe 'Optional attribute patch rules' {
+    BeforeAll {
+        $script:optionalRules = @(
+            (New-TestPatchRule -Path 'target.host' -Value '{host}'),
+            (New-TestPatchRule -Path 'target.port' -Value '{port}'),
+            (New-TestPatchRule -Path 'tls.serverName' -Value '{attr:sni}')
+        )
+        $script:plainEndpoint = [pscustomobject]@{ Host = 'new.example'; Port = 8443; Fields = @{ host = 'new.example'; port = 8443 } }
+    }
+
+    It 'skips a rule whose attribute the candidate lacks, even when its path is absent from the live endpoint' {
+        $config = New-TestConfig -PatchRules $script:optionalRules
+        $blockText = '{"tag":"primary","kind":"proxy","target":{"host":"old.example","port":443}}'
+
+        $parsed = ConvertFrom-Json -InputObject (Update-EndpointBlock -Config $config -BlockText $blockText -Endpoint $script:plainEndpoint)
+
+        $parsed.target.host | Should -Be 'new.example'
+        $parsed.target.port | Should -Be 8443
+        $parsed.PSObject.Properties.Name | Should -Not -Contain 'tls'
+    }
+
+    It 'leaves an existing optional field untouched when the candidate lacks the attribute' {
+        $config = New-TestConfig -PatchRules $script:optionalRules
+        $blockText = '{"tag":"primary","kind":"proxy","target":{"host":"old.example","port":443},"tls":{"serverName":"keep.example"}}'
+
+        $parsed = ConvertFrom-Json -InputObject (Update-EndpointBlock -Config $config -BlockText $blockText -Endpoint $script:plainEndpoint)
+
+        $parsed.tls.serverName | Should -Be 'keep.example'
+    }
+
+    It 'still refuses a missing path when the candidate does carry the attribute' {
+        $config = New-TestConfig -PatchRules $script:optionalRules
+        $blockText = '{"tag":"primary","kind":"proxy","target":{"host":"old.example","port":443}}'
+        $endpoint = [pscustomobject]@{ Host = 'new.example'; Port = 8443; Fields = @{ host = 'new.example'; port = 8443; sni = 'sni.example' } }
+
+        { Update-EndpointBlock -Config $config -BlockText $blockText -Endpoint $endpoint } | Should -Throw '*patch path does not exist: tls.serverName*'
+    }
+
+    It 'still reports a duplicated patch path when the rule would be skipped' {
+        $rules = @(
+            (New-TestPatchRule -Path 'tls.serverName' -Value '{attr:sni}'),
+            (New-TestPatchRule -Path 'tls.serverName' -Value '{attr:sni}')
+        )
+        $config = New-TestConfig -PatchRules $rules
+        $blockText = '{"tag":"primary","kind":"proxy","tls":{"serverName":"keep.example"}}'
+
+        { Update-EndpointBlock -Config $config -BlockText $blockText -Endpoint $script:plainEndpoint } | Should -Throw '*duplicate patch path*'
+    }
+}
