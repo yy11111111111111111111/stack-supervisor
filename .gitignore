@@ -1,0 +1,15 @@
+# Real configuration: contains private hosts and identifiers.
+config/supervisor.json
+config/*.local.json
+
+# Runtime artefacts
+*.log
+backups/
+*_probe-instances-*.json
+config-*.json
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

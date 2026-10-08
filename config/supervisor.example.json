@@ -1,0 +1,123 @@
+{
+  "//": "Copy to supervisor.json, adapt it to your service, and keep that copy out of version control.",
+  "service": {
+    "name": "edge-gateway",
+    "processName": "edge-gateway",
+    "configPath": "C:\\ProgramData\\edge-gateway\\gateway.json",
+    "backupDir": "C:\\ProgramData\\edge-gateway\\backups",
+    "startCommand": "\"C:\\Program Files\\EdgeGateway\\edge-gateway.exe\" serve --config \"{config}\"",
+    "endpointSelector": {
+      "//": "Which object in configPath describes the active upstream, how to read it, and how to rewrite it.",
+      "//2": "requireProperties keeps the lookup unambiguous when the same tag also appears in a nested reference.",
+      "tag": "primary-upstream",
+      "requireProperties": [
+        "kind"
+      ],
+      "readFields": {
+        "host": "target.host",
+        "port": "target.port",
+        "token": "target.id",
+        "sni": "tls.serverName"
+      },
+      "patchRules": [
+        {
+          "pattern": "\"host\"\\s*:\\s*\"[^\"]*\"",
+          "replacement": "\"host\": \"{host}\""
+        },
+        {
+          "pattern": "\"port\"\\s*:\\s*\\d+",
+          "replacement": "\"port\": {port}"
+        },
+        {
+          "pattern": "\"id\"\\s*:\\s*\"[^\"]*\"",
+          "replacement": "\"id\": \"{attr:token}\""
+        },
+        {
+          "pattern": "\"serverName\"\\s*:\\s*\"[^\"]*\"",
+          "replacement": "\"serverName\": \"{attr:sni}\""
+        }
+      ]
+    },
+    "probe": {
+      "//": "The supervisor asks the running service to fetch each target and asserts on the body,",
+      "//2": "so a service that is up but cannot reach its upstream is still reported unhealthy.",
+      "localPort": 1080,
+      "timeoutSec": 12,
+      "targets": [
+        {
+          "url": "https://status-a.example.net/id",
+          "expect": "^198\\.51\\.100\\.",
+          "plain": false
+        },
+        {
+          "url": "https://status-b.example.net/ip",
+          "expect": "^198\\.51\\.100\\.",
+          "plain": false
+        }
+      ]
+    },
+    "catalog": {
+      "//": "Where candidate endpoints come from. Use \"file\" instead of \"url\" for a local feed.",
+      "//2": "Every query parameter of an endpoint URI becomes an attribute usable as {attr:name} in patchRules.",
+      "url": "https://catalog.example.net/endpoints",
+      "format": "base64-uri",
+      "uriPrefix": "edge://",
+      "maxCandidates": 8,
+      "regionRank": {
+        "hk": 0,
+        "jp": 1,
+        "us": 2,
+        "sg": 3
+      }
+    },
+    "candidateTest": {
+      "//": "One isolated instance per candidate, started from this template on its own port.",
+      "probeExecutable": "C:\\Program Files\\EdgeGateway\\edge-gateway.exe",
+      "probeArguments": "serve --config \"{config}\"",
+      "instanceTemplateFile": "probe-instance.template.json",
+      "basePort": 11501,
+      "probeTimeoutSec": 12,
+      "rounds": 2,
+      "wantHealthy": 3
+    }
+  },
+  "policy": {
+    "checkIntervalSec": 60,
+    "failThreshold": 3,
+    "degradedThreshold": 5,
+    "cooldownMin": 10,
+    "missingThreshold": 2
+  },
+  "keepAlive": {
+    "//": "Used by StackKeeper.ps1: one entry per component that must stay alive.",
+    "//2": "Detect by process name or by command line; a command-line pattern must never match the checker itself.",
+    "log": "C:\\ProgramData\\edge-gateway\\keeper.log",
+    "components": [
+      {
+        "name": "gateway-service",
+        "detect": {
+          "kind": "process",
+          "name": "edge-gateway"
+        },
+        "start": "\"C:\\Program Files\\EdgeGateway\\edge-gateway.exe\" serve --config \"C:\\ProgramData\\edge-gateway\\gateway.json\""
+      },
+      {
+        "name": "process-keeper",
+        "detect": {
+          "kind": "commandLine",
+          "pattern": "-File\\s+\"?[^\"]*ProcessKeeper\\.ps1"
+        },
+        "start": "wscript.exe \"C:\\ProgramData\\edge-gateway\\launch-process-keeper.vbs\""
+      },
+      {
+        "name": "supervisor",
+        "detect": {
+          "kind": "commandLine",
+          "pattern": "-File\\s+\"?[^\"]*StackSupervisor\\.ps1"
+        },
+        "start": "wscript.exe \"C:\\ProgramData\\edge-gateway\\launch-supervisor.vbs\""
+      }
+    ]
+  },
+  "log": "C:\\ProgramData\\edge-gateway\\supervisor.log"
+}

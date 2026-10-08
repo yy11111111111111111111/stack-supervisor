@@ -1,0 +1,19 @@
+{
+  "//": "Shape of one isolated probe instance. Tokens: {index} {port} {outbound}.",
+  "listeners": [
+    {
+      "name": "probe-{index}",
+      "address": "127.0.0.1",
+      "port": "{port}"
+    }
+  ],
+  "upstreams": [
+    "{outbound}"
+  ],
+  "routes": [
+    {
+      "from": "probe-{index}",
+      "to": "probe-out-{index}"
+    }
+  ]
+}
