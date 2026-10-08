@@ -109,65 +109,242 @@ function Get-JsonPathValue {
     return $current
 }
 
-function Get-JsonObjectBlock {
-    <#
-        Extracts the raw text of the JSON object that carries a given tag, together with its
-        offsets, so a single object can be patched without reformatting the whole file.
+function Skip-JsonWhitespace {
+    param([Parameter(Mandatory)]$State)
+    while ($State.Index -lt $State.Text.Length -and [int]$State.Text[$State.Index] -in @(9, 10, 13, 32)) {
+        $State.Index++
+    }
+}
 
-        Only objects that declare the tag *and* every property listed in -RequireProperty are
-        accepted. Without that guard a nested reference to the same tag - for example a route
-        that points at the endpoint by name - matches first and the wrong object is rewritten.
-    #>
+function Read-JsonStringToken {
+    param([Parameter(Mandatory)]$State)
+    if ($State.Index -ge $State.Text.Length -or $State.Text[$State.Index] -ne '"') {
+        throw 'expected a JSON string'
+    }
+    $start = $State.Index
+    $State.Index++
+    $closed = $false
+    while ($State.Index -lt $State.Text.Length) {
+        $ch = $State.Text[$State.Index]
+        if ($ch -eq '"') {
+            $State.Index++
+            $closed = $true
+            break
+        }
+        if ([int]$ch -lt 32) { throw 'unescaped control character in JSON string' }
+        if ($ch -eq [char]92) {
+            $State.Index++
+            if ($State.Index -ge $State.Text.Length) { throw 'incomplete JSON escape' }
+            $escaped = $State.Text[$State.Index]
+            if ($escaped -eq 'u') {
+                if ($State.Index + 4 -ge $State.Text.Length) { throw 'incomplete JSON unicode escape' }
+                $hex = $State.Text.Substring($State.Index + 1, 4)
+                if ($hex -notmatch '^[0-9a-fA-F]{4}$') { throw 'invalid JSON unicode escape' }
+                $State.Index += 5
+                continue
+            }
+            $validEscapes = '"' + [char]92 + '/bfnrt'
+            if ($validEscapes.IndexOf([string]$escaped, [System.StringComparison]::Ordinal) -lt 0) {
+                throw 'invalid JSON escape'
+            }
+        }
+        $State.Index++
+    }
+    if (-not $closed) { throw 'unterminated JSON string' }
+    $raw = $State.Text.Substring($start, $State.Index - $start)
+    $value = ConvertFrom-Json -InputObject $raw -ErrorAction Stop
+    return [pscustomobject]@{ Start = $start; End = $State.Index; Value = [string]$value }
+}
+
+function ConvertTo-JsonPointerSegment {
+    param([Parameter(Mandatory)][string]$Segment)
+    return $Segment.Replace('~', '~0').Replace('/', '~1')
+}
+
+function Read-JsonValueToken {
+    param([Parameter(Mandatory)]$State, [string]$Path = '')
+    Skip-JsonWhitespace -State $State
+    if ($State.Index -ge $State.Text.Length) { throw 'unexpected end of JSON document' }
+    $start = $State.Index
+    $ch = $State.Text[$State.Index]
+
+    if ($ch -eq '{') {
+        $State.Index++
+        Skip-JsonWhitespace -State $State
+        $members = New-Object System.Collections.ArrayList
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        if ($State.Index -lt $State.Text.Length -and $State.Text[$State.Index] -eq '}') {
+            $State.Index++
+            return [pscustomobject]@{ Kind = 'Object'; Start = $start; End = $State.Index; Path = $Path; Value = $null; Members = @(); Items = @() }
+        }
+        while ($true) {
+            Skip-JsonWhitespace -State $State
+            $key = Read-JsonStringToken -State $State
+            if (-not $seen.Add($key.Value)) { throw ('duplicate JSON property: ' + $key.Value) }
+            Skip-JsonWhitespace -State $State
+            if ($State.Index -ge $State.Text.Length -or $State.Text[$State.Index] -ne ':') { throw 'expected colon after JSON property name' }
+            $State.Index++
+            $childPath = $Path + '/' + (ConvertTo-JsonPointerSegment -Segment $key.Value)
+            $child = Read-JsonValueToken -State $State -Path $childPath
+            $members.Add([pscustomobject]@{ Name = $key.Value; KeyStart = $key.Start; Node = $child }) | Out-Null
+            Skip-JsonWhitespace -State $State
+            if ($State.Index -ge $State.Text.Length) { throw 'unterminated JSON object' }
+            if ($State.Text[$State.Index] -eq '}') { $State.Index++; break }
+            if ($State.Text[$State.Index] -ne ',') { throw 'expected comma or closing brace in JSON object' }
+            $State.Index++
+        }
+        return [pscustomobject]@{ Kind = 'Object'; Start = $start; End = $State.Index; Path = $Path; Value = $null; Members = @($members.ToArray()); Items = @() }
+    }
+
+    if ($ch -eq '[') {
+        $State.Index++
+        Skip-JsonWhitespace -State $State
+        $items = New-Object System.Collections.ArrayList
+        if ($State.Index -lt $State.Text.Length -and $State.Text[$State.Index] -eq ']') {
+            $State.Index++
+            return [pscustomobject]@{ Kind = 'Array'; Start = $start; End = $State.Index; Path = $Path; Value = $null; Members = @(); Items = @() }
+        }
+        $index = 0
+        while ($true) {
+            $childPath = $Path + '/' + [string]$index
+            $child = Read-JsonValueToken -State $State -Path $childPath
+            $items.Add($child) | Out-Null
+            $index++
+            Skip-JsonWhitespace -State $State
+            if ($State.Index -ge $State.Text.Length) { throw 'unterminated JSON array' }
+            if ($State.Text[$State.Index] -eq ']') { $State.Index++; break }
+            if ($State.Text[$State.Index] -ne ',') { throw 'expected comma or closing bracket in JSON array' }
+            $State.Index++
+        }
+        return [pscustomobject]@{ Kind = 'Array'; Start = $start; End = $State.Index; Path = $Path; Value = $null; Members = @(); Items = @($items.ToArray()) }
+    }
+
+    if ($ch -eq '"') {
+        $string = Read-JsonStringToken -State $State
+        return [pscustomobject]@{ Kind = 'String'; Start = $string.Start; End = $string.End; Path = $Path; Value = $string.Value; Members = @(); Items = @() }
+    }
+
+    $remaining = $State.Text.Substring($State.Index)
+    if ($remaining.StartsWith('true', [System.StringComparison]::Ordinal)) {
+        $State.Index += 4
+        return [pscustomobject]@{ Kind = 'Boolean'; Start = $start; End = $State.Index; Path = $Path; Value = $true; Members = @(); Items = @() }
+    }
+    if ($remaining.StartsWith('false', [System.StringComparison]::Ordinal)) {
+        $State.Index += 5
+        return [pscustomobject]@{ Kind = 'Boolean'; Start = $start; End = $State.Index; Path = $Path; Value = $false; Members = @(); Items = @() }
+    }
+    if ($remaining.StartsWith('null', [System.StringComparison]::Ordinal)) {
+        $State.Index += 4
+        return [pscustomobject]@{ Kind = 'Null'; Start = $start; End = $State.Index; Path = $Path; Value = $null; Members = @(); Items = @() }
+    }
+    $number = [regex]::Match($remaining, '^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?')
+    if ($number.Success) {
+        $State.Index += $number.Length
+        return [pscustomobject]@{ Kind = 'Number'; Start = $start; End = $State.Index; Path = $Path; Value = $number.Value; Members = @(); Items = @() }
+    }
+    throw ('invalid JSON value at offset ' + $State.Index)
+}
+
+function Get-JsonDocumentTree {
+    param([Parameter(Mandatory)][string]$Text)
+    $state = @{ Text = $Text; Index = 0 }
+    $root = Read-JsonValueToken -State $state
+    Skip-JsonWhitespace -State $state
+    if ($state.Index -ne $Text.Length) { throw ('unexpected content after JSON value at offset ' + $state.Index) }
+    return $root
+}
+
+function Get-JsonMemberNode {
+    param([Parameter(Mandatory)]$Node, [Parameter(Mandatory)][string]$Name)
+    if ($Node.Kind -ne 'Object') { return $null }
+    foreach ($member in $Node.Members) {
+        if ([string]::Equals([string]$member.Name, $Name, [System.StringComparison]::Ordinal)) { return $member.Node }
+    }
+    return $null
+}
+
+function Get-JsonPathNode {
+    param([Parameter(Mandatory)]$Node, [Parameter(Mandatory)][string]$Path)
+    $current = $Node
+    foreach ($segment in $Path.Split('.')) {
+        $match = [regex]::Match($segment, '^([^\[\]]+)(?:\[(\d+)\])?$')
+        if (-not $match.Success) { return $null }
+        $current = Get-JsonMemberNode -Node $current -Name $match.Groups[1].Value
+        if (-not $current) { return $null }
+        if ($match.Groups[2].Success) {
+            if ($current.Kind -ne 'Array') { return $null }
+            $index = [int]$match.Groups[2].Value
+            if ($index -ge $current.Items.Count) { return $null }
+            $current = $current.Items[$index]
+        }
+    }
+    return $current
+}
+
+function Get-JsonNodeByPointer {
+    param([Parameter(Mandatory)]$Root, [Parameter(Mandatory)][string]$Pointer)
+    if (-not $Pointer) { return $Root }
+    if (-not $Pointer.StartsWith('/')) { return $null }
+    $current = $Root
+    foreach ($rawSegment in $Pointer.Substring(1).Split('/')) {
+        $segment = $rawSegment.Replace('~1', '/').Replace('~0', '~')
+        if ($current.Kind -eq 'Object') {
+            $current = Get-JsonMemberNode -Node $current -Name $segment
+        } elseif ($current.Kind -eq 'Array' -and $segment -match '^\d+$') {
+            $index = [int]$segment
+            if ($index -ge $current.Items.Count) { return $null }
+            $current = $current.Items[$index]
+        } else { return $null }
+        if (-not $current) { return $null }
+    }
+    return $current
+}
+
+function Get-JsonObjectNodes {
+    param([Parameter(Mandatory)]$Node)
+    if ($Node.Kind -eq 'Object') {
+        Write-Output -NoEnumerate $Node
+        foreach ($member in $Node.Members) { Get-JsonObjectNodes -Node $member.Node }
+    } elseif ($Node.Kind -eq 'Array') {
+        foreach ($item in $Node.Items) { Get-JsonObjectNodes -Node $item }
+    }
+}
+
+function Get-JsonObjectBlock {
+    <# Finds exactly one JSON object with a direct tag property and all required siblings. #>
     param(
         [Parameter(Mandatory)][string]$Text,
         [Parameter(Mandatory)][string]$Tag,
         [string[]]$RequireProperty = @()
     )
-    $needle = '"tag"' + ': "' + $Tag + '"'
-    $from = 0
-    while ($true) {
-        $idx = $Text.IndexOf($needle, $from, [System.StringComparison]::Ordinal)
-        if ($idx -lt 0) { return $null }
-        $from = $idx + 1
-        $start = $Text.LastIndexOf('{', $idx)
-        if ($start -lt 0) { continue }
-        $depth = 0; $inString = $false; $escaped = $false
-        for ($i = $start; $i -lt $Text.Length; $i++) {
-            $ch = $Text[$i]
-            if ($inString) {
-                if ($escaped) { $escaped = $false }
-                elseif ($ch -eq [char]92) { $escaped = $true }
-                elseif ($ch -eq '"') { $inString = $false }
-            } else {
-                if ($ch -eq '"') { $inString = $true }
-                elseif ($ch -eq '{') { $depth++ }
-                elseif ($ch -eq '}') {
-                    $depth--
-                    if ($depth -eq 0) {
-                        $candidate = $Text.Substring($start, $i - $start + 1)
-                        $accepted = $false
-                        try {
-                            $parsed = $candidate | ConvertFrom-Json
-                            if ($parsed.tag -eq $Tag) {
-                                $accepted = $true
-                                foreach ($property in $RequireProperty) {
-                                    if (-not $parsed.PSObject.Properties.Name.Contains($property)) { $accepted = $false }
-                                }
-                            }
-                        } catch { }
-                        if ($accepted) { return [pscustomobject]@{ Start = $start; End = $i; Text = $candidate } }
-                        break
-                    }
-                }
-            }
+    try { $root = Get-JsonDocumentTree -Text $Text } catch { return $null }
+    $matches = New-Object System.Collections.ArrayList
+    foreach ($candidate in @(Get-JsonObjectNodes -Node $root)) {
+        $tagNode = Get-JsonMemberNode -Node $candidate -Name 'tag'
+        if (-not $tagNode -or $tagNode.Kind -ne 'String' -or $tagNode.Value -cne $Tag) { continue }
+        $accepted = $true
+        foreach ($property in $RequireProperty) {
+            if (-not (Get-JsonMemberNode -Node $candidate -Name ([string]$property))) { $accepted = $false; break }
         }
+        if ($accepted) { $matches.Add($candidate) | Out-Null }
     }
-    return $null
+    if ($matches.Count -ne 1) { return $null }
+    $object = $matches[0]
+    return [pscustomobject]@{
+        Start = $object.Start
+        End = $object.End
+        Path = $object.Path
+        Text = $Text.Substring($object.Start, $object.End - $object.Start)
+    }
 }
 
-function Set-RegexFirst {
-    param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][string]$Pattern, [Parameter(Mandatory)][string]$Replacement)
-    return ([regex]::new($Pattern)).Replace($Text, $Replacement, 1)
+function Set-JsonStringPathValue {
+    param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Value)
+    $tree = Get-JsonDocumentTree -Text $Text
+    $node = Get-JsonPathNode -Node $tree -Path $Path
+    if (-not $node -or $node.Kind -ne 'String') { throw ('JSON path is not a string value: ' + $Path) }
+    $rawValue = [string](ConvertTo-Json -InputObject $Value -Compress -Depth 100)
+    return $Text.Substring(0, $node.Start) + $rawValue + $Text.Substring($node.End)
 }
 
 function Expand-Template {
@@ -214,6 +391,37 @@ function Get-Selector {
 
 #region ------------------------------------------------------------------- probe
 
+function Read-HttpHeaderBlock {
+    <# Reads through CRLF CRLF without buffering or consuming bytes from the next protocol layer. #>
+    param([Parameter(Mandatory)][System.IO.Stream]$Stream, [int]$MaxBytes = 65536)
+    $header = New-Object System.IO.MemoryStream
+    $one = New-Object byte[] 1
+    $matched = 0
+    try {
+        while ($header.Length -lt $MaxBytes) {
+            $read = $Stream.Read($one, 0, 1)
+            if ($read -le 0) { throw 'connection closed before HTTP headers completed' }
+            $byte = $one[0]
+            $header.WriteByte($byte)
+            switch ($matched) {
+                0 { if ($byte -eq 13) { $matched = 1 } }
+                1 {
+                    if ($byte -eq 10) { $matched = 2 }
+                    elseif ($byte -eq 13) { $matched = 1 }
+                    else { $matched = 0 }
+                }
+                2 { if ($byte -eq 13) { $matched = 3 } else { $matched = 0 } }
+                3 {
+                    if ($byte -eq 10) { return [System.Text.Encoding]::ASCII.GetString($header.ToArray()) }
+                    elseif ($byte -eq 13) { $matched = 1 }
+                    else { $matched = 0 }
+                }
+            }
+        }
+        throw ('HTTP headers exceeded the {0}-byte limit' -f $MaxBytes)
+    } finally { $header.Dispose() }
+}
+
 function Invoke-GatewayProbe {
     <#
         Sends one request through the local service endpoint and returns the raw response.
@@ -228,6 +436,7 @@ function Invoke-GatewayProbe {
     )
     $uri = [System.Uri]$Url
     $client = New-Object System.Net.Sockets.TcpClient
+    $ssl = $null
     try {
         $iar = $client.BeginConnect('127.0.0.1', $LocalPort, $null, $null)
         if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutSec * 1000)) { throw 'connect timeout' }
@@ -241,10 +450,9 @@ function Invoke-GatewayProbe {
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($connect)
         $stream.Write($bytes, 0, $bytes.Length); $stream.Flush()
 
-        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::ASCII, $false, 1024, $true)
-        $status = $reader.ReadLine()
-        if (-not $status -or $status -notmatch ' 200') { throw "endpoint refused CONNECT: $status" }
-        while ($true) { $line = $reader.ReadLine(); if ([string]::IsNullOrEmpty($line)) { break } }
+        $connectResponse = Read-HttpHeaderBlock -Stream $stream
+        $status = ($connectResponse -split "`r`n", 2)[0]
+        if (-not $status -or $status -notmatch '^HTTP/\d(?:\.\d)?\s+200(?:\s|$)') { throw "endpoint refused CONNECT: $status" }
 
         $active = $stream
         if (-not $NoTls) {
@@ -268,7 +476,10 @@ function Invoke-GatewayProbe {
             $memory.Write($buffer, 0, $read)
         }
         return [System.Text.Encoding]::UTF8.GetString($memory.ToArray())
-    } finally { $client.Close() }
+    } finally {
+        if ($ssl) { $ssl.Dispose() }
+        $client.Close()
+    }
 }
 
 function Get-HealthTargets {
@@ -328,15 +539,62 @@ function Get-ActiveEndpoint {
 }
 
 function Update-EndpointBlock {
-    <# Applies the configured patch rules to one endpoint block and returns the new text. #>
+    <# Applies path-based source-span patches, then compatible unique legacy regex patches. #>
     param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$BlockText, [Parameter(Mandatory)]$Endpoint)
     $selector = Get-Selector -Config $Config
     $tokens = @{ host = $Endpoint.Host; port = $Endpoint.Port }
     foreach ($key in $Endpoint.Fields.Keys) {
-        if ($key -ne 'host' -and $key -ne 'port' -and $Endpoint.Fields[$key]) { $tokens['attr:' + $key] = [string]$Endpoint.Fields[$key] }
+        if ($key -ne 'host' -and $key -ne 'port' -and $null -ne $Endpoint.Fields[$key]) {
+            $tokens['attr:' + $key] = [string]$Endpoint.Fields[$key]
+        }
     }
     $patched = $BlockText
+    $tree = Get-JsonDocumentTree -Text $BlockText
+    $edits = New-Object System.Collections.ArrayList
+    $legacyRules = New-Object System.Collections.ArrayList
+    $usedPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
     foreach ($rule in $selector.Patch) {
+        $pathProperty = $rule.PSObject.Properties['path']
+        $valueProperty = $rule.PSObject.Properties['value']
+        if ($pathProperty -and $valueProperty) {
+            $path = [string]$pathProperty.Value
+            if (-not $usedPaths.Add($path)) { throw ('duplicate patch path: ' + $path) }
+            $node = Get-JsonPathNode -Node $tree -Path $path
+            if (-not $node) { throw ('patch path does not exist: ' + $path) }
+            if ($node.Kind -notin @('String', 'Number', 'Boolean')) { throw ('patch path is not a scalar value: ' + $path) }
+            $template = [string]$valueProperty.Value
+            $skip = $false
+            foreach ($match in [regex]::Matches($template, '\{attr:([^\}]+)\}')) {
+                if (-not $tokens.ContainsKey('attr:' + $match.Groups[1].Value)) { $skip = $true; break }
+            }
+            if ($skip) { continue }
+            $value = Expand-Template -Template $template -Tokens $tokens
+            if ($node.Kind -eq 'String') {
+                $rawValue = [string](ConvertTo-Json -InputObject ([string]$value) -Compress -Depth 100)
+            } elseif ($node.Kind -eq 'Number') {
+                if ($value -notmatch '^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$') {
+                    throw ('patch value is not a JSON number for path: ' + $path)
+                }
+                $rawValue = [string]$value
+            } else {
+                $rawValue = ([string]$value).ToLowerInvariant()
+                if ($rawValue -notin @('true', 'false')) { throw ('patch value is not a JSON boolean for path: ' + $path) }
+            }
+            $edits.Add([pscustomobject]@{ Start = $node.Start; End = $node.End; Text = $rawValue }) | Out-Null
+            continue
+        }
+
+        # Existing configurations may still use pattern/replacement. Keep them safe by
+        # refusing zero or multiple matches instead of silently patching the first one.
+        if (-not $rule.PSObject.Properties['pattern'] -or -not $rule.PSObject.Properties['replacement']) {
+            throw 'patch rule must define either path/value or pattern/replacement'
+        }
+        $legacyRules.Add($rule) | Out-Null
+    }
+    foreach ($edit in @($edits | Sort-Object -Property Start -Descending)) {
+        $patched = $patched.Substring(0, $edit.Start) + $edit.Text + $patched.Substring($edit.End)
+    }
+    foreach ($rule in $legacyRules) {
         $replacement = [string]$rule.replacement
         $skip = $false
         foreach ($match in [regex]::Matches($replacement, '\{attr:([^\}]+)\}')) {
@@ -344,7 +602,12 @@ function Update-EndpointBlock {
             if (-not $tokens.ContainsKey('attr:' + $name)) { $skip = $true; break }
         }
         if ($skip) { continue }
-        $patched = Set-RegexFirst -Text $patched -Pattern ([string]$rule.pattern) -Replacement (Expand-Template -Template $replacement -Tokens $tokens)
+        $pattern = [string]$rule.pattern
+        $matches = [regex]::Matches($patched, $pattern)
+        if ($matches.Count -ne 1) { throw ('legacy patch pattern must match exactly once: ' + $pattern) }
+        $match = $matches[0]
+        $replacement = Expand-Template -Template $replacement -Tokens $tokens
+        $patched = $patched.Substring(0, $match.Index) + $replacement + $patched.Substring($match.Index + $match.Length)
     }
     return $patched
 }
@@ -358,26 +621,23 @@ function Set-ActiveEndpoint {
     $block = Get-JsonObjectBlock -Text $text -Tag $selector.Tag -RequireProperty $selector.Required
     if (-not $block) { Write-Log -Message 'endpoint block not found; refusing to write' -Path $Config.log; return $false }
 
-    $updated = $text.Substring(0, $block.Start) + (Update-EndpointBlock -Config $Config -BlockText $block.Text -Endpoint $Endpoint) + $text.Substring($block.End + 1)
-
     try {
-        $parsed = $updated | ConvertFrom-Json
-        $object = $null
-        foreach ($candidate in $parsed.PSObject.Properties) {
-            if ($candidate.Value -isnot [System.Array]) { continue }
-            foreach ($item in $candidate.Value) {
-                if ($item.PSObject.Properties.Name.Contains('tag') -and $item.tag -eq $selector.Tag) { $object = $item }
-            }
-        }
-        if (-not $object) { Write-Log -Message 'read-back could not locate the endpoint block' -Path $Config.log; return $false }
-        $host = Get-JsonPathValue -Object $object -Path ([string]$selector.Read.host)
-        $port = Get-JsonPathValue -Object $object -Path ([string]$selector.Read.port)
-        if ([string]$host -ne [string]$Endpoint.Host -or [int]$port -ne [int]$Endpoint.Port) {
+        $updated = $text.Substring(0, $block.Start) + (Update-EndpointBlock -Config $Config -BlockText $block.Text -Endpoint $Endpoint) + $text.Substring($block.End)
+        $parsed = ConvertFrom-Json -InputObject $updated -ErrorAction Stop
+        $tree = Get-JsonDocumentTree -Text $updated
+        $object = Get-JsonNodeByPointer -Root $tree -Pointer $block.Path
+        if (-not $object -or $object.Kind -ne 'Object') { Write-Log -Message 'read-back could not locate the patched endpoint path' -Path $Config.log; return $false }
+        $hostNode = Get-JsonPathNode -Node $object -Path ([string]$selector.Read.host)
+        $portNode = Get-JsonPathNode -Node $object -Path ([string]$selector.Read.port)
+        if (-not $hostNode -or -not $portNode) { Write-Log -Message 'read-back could not resolve endpoint fields at the selected path' -Path $Config.log; return $false }
+        $readBackHost = $hostNode.Value
+        $port = $portNode.Value
+        if ([string]$readBackHost -ne [string]$Endpoint.Host -or [int]$port -ne [int]$Endpoint.Port) {
             Write-Log -Message 'read-back validation failed; refusing to write' -Path $Config.log
             return $false
         }
     } catch {
-        Write-Log -Message ('updated configuration does not parse: ' + $_.Exception.Message) -Path $Config.log
+        Write-Log -Message ('patch or read-back validation failed; refusing to write: ' + $_.Exception.Message) -Path $Config.log
         return $false
     }
 
@@ -497,9 +757,7 @@ function Invoke-CandidateMeasurement {
     try {
         for ($i = 0; $i -lt $Candidates.Count; $i++) {
             $port = [int]$test.basePort + $i
-            $tagPattern = '"tag"\s*:\s*"' + [regex]::Escape($selector.Tag) + '"'
-            $tagValue = '"tag": "probe-out-' + $i + '"'
-            $blockText = Set-RegexFirst -Text $liveBlock.Text -Pattern $tagPattern -Replacement $tagValue
+            $blockText = Set-JsonStringPathValue -Text $liveBlock.Text -Path 'tag' -Value ('probe-out-' + $i)
             $blockText = Update-EndpointBlock -Config $Config -BlockText $blockText -Endpoint $Candidates[$i]
             $document = Expand-Template -Template $template -Tokens @{ index = $i; port = $port; outbound = $blockText }
             $configFile = Join-Path $workDir ('_probe-' + $PID + '-' + $i + '.json')
@@ -579,19 +837,84 @@ function Start-ServiceProcess {
     }
 }
 
+function Get-ServiceProcessSnapshot {
+    <# Separates same-name processes from the unique instance identified by its config path. #>
+    param([Parameter(Mandatory)]$Config)
+    $name = [System.IO.Path]::GetFileName([string]$Config.service.processName)
+    if ([System.IO.Path]::GetExtension($name) -eq '') { $name += '.exe' }
+    $filter = "Name='" + $name.Replace("'", "''") + "'"
+    $processes = @(Get-CimInstance -ClassName Win32_Process -Filter $filter -ErrorAction Stop)
+    $configPath = [System.IO.Path]::GetFullPath([string]$Config.service.configPath)
+    $matching = @($processes | Where-Object {
+        $_.CommandLine -and ([string]$_.CommandLine).Replace('/', '\').IndexOf($configPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    })
+    return [pscustomobject]@{ Processes = $processes; Matching = $matching }
+}
+
+function Get-ServiceProcessCandidates {
+    param([Parameter(Mandatory)]$Config)
+    $snapshot = Get-ServiceProcessSnapshot -Config $Config
+    return @($snapshot.Matching)
+}
+
 function Restart-ServiceProcess {
     param([Parameter(Mandatory)]$Config, [int]$WaitSec = 40)
-    $name = [string]$Config.service.processName
-    Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    try { $targets = @(Get-ServiceProcessCandidates -Config $Config) }
+    catch {
+        Write-Log -Message ('cannot inspect service processes; refusing to restart: ' + $_.Exception.Message) -Path $Config.log
+        return $false
+    }
+    if ($targets.Count -ne 1) {
+        Write-Log -Message ('cannot safely identify one configured service process (found {0}); refusing to stop processes by name' -f $targets.Count) -Path $Config.log
+        return $false
+    }
+    $targetId = [int]$targets[0].ProcessId
+    Stop-Process -Id $targetId -Force -ErrorAction SilentlyContinue
     $deadline = (Get-Date).AddSeconds($WaitSec)
     while ((Get-Date) -lt $deadline) {
+        try { $running = @(Get-ServiceProcessCandidates -Config $Config) }
+        catch {
+            Write-Log -Message ('cannot inspect service processes during restart: ' + $_.Exception.Message) -Path $Config.log
+            return $false
+        }
+        if ($running.Count -gt 1) {
+            Write-Log -Message 'multiple configured service processes appeared during restart; refusing to choose one' -Path $Config.log
+            return $false
+        }
+        if ($running.Count -eq 1 -and [int]$running[0].ProcessId -ne $targetId) { return $true }
         Start-Sleep -Seconds 2
-        if (Get-Process -Name $name -ErrorAction SilentlyContinue) { return $true }
+    }
+    try { $remaining = @(Get-ServiceProcessCandidates -Config $Config) }
+    catch {
+        Write-Log -Message ('cannot verify service stop; refusing to start another instance: ' + $_.Exception.Message) -Path $Config.log
+        return $false
+    }
+    if ($remaining.Count -gt 1) {
+        Write-Log -Message 'multiple configured service processes appeared during restart; refusing to start another instance' -Path $Config.log
+        return $false
+    }
+    if ($remaining.Count -eq 1 -and [int]$remaining[0].ProcessId -ne $targetId) { return $true }
+    if ($remaining.Count -eq 1) {
+        Write-Log -Message 'configured service process did not stop in time; refusing to start another instance' -Path $Config.log
+        return $false
     }
     Write-Log -Message 'external keeper did not restart the service in time; starting it here' -Path $Config.log
     Start-ServiceProcess -Config $Config
-    Start-Sleep -Seconds 4
-    return [bool](Get-Process -Name $name -ErrorAction SilentlyContinue)
+    $startDeadline = (Get-Date).AddSeconds([Math]::Max(4, $WaitSec))
+    while ((Get-Date) -lt $startDeadline) {
+        try { $running = @(Get-ServiceProcessCandidates -Config $Config) }
+        catch {
+            Write-Log -Message ('cannot verify service start: ' + $_.Exception.Message) -Path $Config.log
+            return $false
+        }
+        if ($running.Count -eq 1) { return $true }
+        if ($running.Count -gt 1) {
+            Write-Log -Message 'multiple configured service processes appeared after restart' -Path $Config.log
+            return $false
+        }
+        Start-Sleep -Seconds 1
+    }
+    return $false
 }
 
 function Test-UpstreamReachability {
@@ -693,18 +1016,40 @@ Write-Log -Message ('supervisor started (interval {0}s, fail threshold {1}, degr
 
 $failures = 0; $degraded = 0; $missing = 0
 $lastSwitch = [datetime]::MinValue
-$serviceName = [string]$config.service.processName
 
 while ($true) {
-    if (-not (Get-Process -Name $serviceName -ErrorAction SilentlyContinue)) {
+    try { $serviceState = Get-ServiceProcessSnapshot -Config $config }
+    catch {
+        Write-Log -Message ('cannot inspect service processes; deferring recovery: ' + $_.Exception.Message) -Path $logPath
+        $missing = 0; $failures = 0; $degraded = 0
+        if ($Once) { break }
+        Start-Sleep -Seconds $CheckIntervalSec
+        continue
+    }
+    if ($serviceState.Matching.Count -gt 1 -or ($serviceState.Processes.Count -gt 0 -and $serviceState.Matching.Count -eq 0)) {
+        Write-Log -Message 'service executable is present but its configured instance is ambiguous; deferring recovery' -Path $logPath
+        $missing = 0; $failures = 0; $degraded = 0
+        if ($Once) { break }
+        Start-Sleep -Seconds $CheckIntervalSec
+        continue
+    }
+    if ($serviceState.Matching.Count -eq 0) {
         $missing++
         if ($missing -eq 1) { Write-Log -Message 'service process is not running; deferring to the process keeper' -Path $logPath }
         if ($missing -ge $MissingThreshold) {
             Write-Log -Message ('service missing for {0} rounds and the process keeper has not acted; starting it here' -f $missing) -Path $logPath
             Start-ServiceProcess -Config $config
             Start-Sleep -Seconds 5
-            if (Get-Process -Name $serviceName -ErrorAction SilentlyContinue) {
+            try { $startedState = Get-ServiceProcessSnapshot -Config $config }
+            catch {
+                Write-Log -Message ('cannot verify service start; will not launch another instance yet: ' + $_.Exception.Message) -Path $logPath
+                $startedState = $null
+            }
+            if ($startedState -and $startedState.Matching.Count -eq 1) {
                 Write-Log -Message 'service started by the supervisor' -Path $logPath
+                $missing = 0
+            } elseif ($startedState -and ($startedState.Matching.Count -gt 1 -or $startedState.Processes.Count -gt 0)) {
+                Write-Log -Message 'service start is ambiguous; deferring further recovery' -Path $logPath
                 $missing = 0
             }
         }

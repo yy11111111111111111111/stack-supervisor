@@ -118,10 +118,9 @@ the second instance exit immediately instead of fighting over the configuration 
 
 ## Status and limitations
 
-This is a working tool, not a finished one. `docs/LIMITATIONS.md` lists - bluntly - the
-parts the author is least confident about, including several High severity concerns in the
-configuration patching and service restart paths. `tests/` describes the test suite the
-project needs but does not have yet, and `CONTRIBUTING.md` explains how to help.
+This is a working tool, not a finished one. `docs/LIMITATIONS.md` tracks open risks and
+recently resolved items. `tests/` contains the Pester v5 regression suite; run it with
+`.\tests\Invoke-Tests.ps1`. `CONTRIBUTING.md` explains how to help.
 
 If you are reviewing this project: start with the limitations list, then the incidents in
 `docs/LESSONS.md`. Both are written to be attacked.

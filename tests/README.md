@@ -1,7 +1,8 @@
 # Tests
 
-There are no automated tests yet. This directory documents what the suite is expected to
-cover and provides the harness it should plug into.
+The Pester v5 suite is in `StackSupervisor.Tests.ps1`. Run it with
+`.\Invoke-Tests.ps1`; it uses fixtures and mocks, plus a loopback socket for the probe
+protocol. It does not require a gateway service or external endpoint.
 
 ## Why it matters more than usual here
 
@@ -19,19 +20,20 @@ and an assertion.
 ## Harness
 
 `Invoke-Tests.ps1` runs [Pester](https://pester.dev) v5 when it is installed and exits with
-a clear message when it is not. Tests are expected to be self-contained and to run on a
-clean Windows host without a gateway service present:
+a clear message when it is not. Tests are self-contained and run on a clean Windows host
+without a gateway service present:
 
 | Layer | How it should be exercised |
 |---|---|
-| JSON block discovery | Fixture files only. No process, no network. |
-| Patch rules and read-back validation | Fixture files written to a temporary directory; assert the resulting text and the restore path when validation fails. |
+| JSON block discovery | Fixture JSON, including an earlier nested tag reference, escaped strings, duplicate keys and ambiguous endpoint objects. |
+| Patch rules and read-back validation | Temporary fixture files; assert exact path updates, preservation of similarly named nested fields, backup creation and selected-path validation. Legacy regex rules must be unique. |
 | Health scoring | Mock the probe function (Pester `Mock`) and drive the score table 2 / 1 / 0. |
-| Failover decision logic | Mock catalog fetch and candidate measurement; assert *which* endpoint would be written, including the *no better candidate means no write* rule. |
-| Keeper component detection | Synthetic process list objects; assert the self-match exclusion. |
-| Probe protocol | A loopback TCP listener that speaks a canned CONNECT response; assert header and body handling, including a body larger than the reader buffer. |
+| Failover decision logic | Mock catalog fetch and candidate measurement; assert that no configuration write occurs when no candidate beats the active score. |
+| Keeper component detection | Synthetic process-list objects; assert the self-match exclusion. |
+| Probe protocol | A loopback TCP listener sends a canned CONNECT header followed by more than 1 KiB of buffered bytes; assert the reader leaves all bytes after the header available. |
 
 ## Current state
 
-`Invoke-Tests.ps1` only reports that no test files exist. It is the contract, not the suite.
-
+The suite also covers process identity for restart: a same-name process using another
+configuration is ignored, and restart refuses to stop when it cannot identify one unique
+configured instance.

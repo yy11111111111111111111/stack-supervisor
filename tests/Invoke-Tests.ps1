@@ -1,11 +1,10 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Test harness. Runs the Pester suite when Pester v5 is available.
+    Runs the Pester v5 test suite.
 .DESCRIPTION
-    The suite itself does not exist yet - see README.md in this directory for the coverage
-    the project needs. This script is the contract that suite plugs into, so that CI wiring
-    and contributor instructions do not have to change when tests are added.
+    Discovers *.Tests.ps1 files in the selected directory and runs them. Use -CI to treat a
+    missing suite as a failure.
 .EXAMPLE
     .\Invoke-Tests.ps1
 #>
@@ -20,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 
 $tests = @(Get-ChildItem -LiteralPath $Path -Filter '*.Tests.ps1' -ErrorAction SilentlyContinue)
 if ($tests.Count -eq 0) {
-    Write-Host 'No test files found. See tests/README.md for the coverage this project needs.'
+    Write-Host 'No test files found. See tests/README.md for the expected coverage.'
     if ($CI) { exit 1 }
     exit 0
 }

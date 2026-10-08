@@ -2,38 +2,43 @@
 
 This supervisor runs in production on one host, but parts of it are best described as
 *the first version that survived the incidents in LESSONS.md*, not as finished work.
-The list below is deliberately blunt. It is the map of where review effort pays off most,
-and it is the reason the repository asks for help rather than presenting itself as done.
+The list below is deliberately blunt. It includes current risks and recently addressed
+items with their status, so contributors can see both where review effort pays off and
+which issue references have been closed by code.
 
-## Things the author is not confident about
+## Risk areas and status
 
-| # | Area | Concern | Severity |
-|---|---|---|---|
-| 1 | `Invoke-GatewayProbe` | Response headers are read with a `StreamReader` wrapped around the socket stream, then the body is read from the same underlying stream. A buffering reader can consume bytes past the header terminator, which would truncate the body and make a healthy target look broken. | High |
-| 2 | `Invoke-GatewayProbe` | `RemoteCertificateValidationCallback { $true }` disables certificate validation completely. Fine for a liveness probe, wrong the moment the body is used for a decision with security meaning. | Medium |
-| 3 | `Get-JsonObjectBlock` | Brace matching is string- and escape-aware, but it is hand-written. Braces inside strings, unusual escape sequences, or comment syntax would confuse it, and it is the component that decides *which object gets rewritten*. | High |
-| 4 | `Set-ActiveEndpoint` read-back | After re-parsing, the patched object is located by walking every array-valued property looking for a matching tag. That is a heuristic, not a path lookup, and it could validate the wrong object. | Medium |
-| 5 | Patch rules | `patchRules` replace the **first** match inside the block. A pattern that also matches a nested field silently rewrites the wrong value. | High |
-| 6 | `Start-ServiceProcess` | The start command is split with a regular expression. Paths with spaces, embedded quotes or `=` inside arguments will break it. | Medium |
-| 7 | `Restart-ServiceProcess` | The service is stopped by process **name**. Two instances of the same executable would both die. | High for multi-instance hosts |
-| 8 | Catalog fetch | `Invoke-WebRequest` under Windows PowerShell 5.1 uses legacy TLS defaults unless `ServicePointManager` is configured, so a modern endpoint can fail with a confusing message. | Medium |
-| 9 | No tests | There is **no automated test of any kind**. Every path was validated against a live host, by hand. | Critical for contributors |
-| 10 | Logging | Append-only with no rotation, no size cap, no structured format and no counters. | Low to Medium |
-| 11 | Candidate fan-out | Every probe instance starts at once: `maxCandidates = 8` means 8 processes and 8 generated files at peak. | Medium on small hosts |
-| 12 | Mutex granularity | The single-instance mutex is keyed on the service name alone, so two supervisors with different configurations for the same service would exclude each other. | Low |
-| 13 | Reachability probe | `Test-UpstreamReachability` hardcodes `1.1.1.1:443`. | Low |
-| 14 | `-ForceSwitch` semantics | Forced mode ignores the *strictly better* rule as documented, but it also skips the cooldown. That combination is easy to misuse. | Low |
-| 15 | Locale assumptions | Timestamps and `yyyyMMddHHmmss` backup names are assumed to be locale independent. Not verified under non-Gregorian calendars or unusual regional settings. | Low |
+| # | Area | Concern | Severity | Status |
+|---|---|---|---|---|
+| 1 | `Invoke-GatewayProbe` | A buffering reader could consume bytes after the CONNECT header terminator. | High | Resolved: exact-length header reader |
+| 2 | `Invoke-GatewayProbe` | `RemoteCertificateValidationCallback { $true }` disables certificate validation even though the response body drives a recovery decision. | Medium | Open |
+| 3 | `Get-JsonObjectBlock` | Brace scanning could misidentify the object to rewrite. | High | Resolved: strict JSON tree with source spans |
+| 4 | `Set-ActiveEndpoint` read-back | Heuristic object search could validate the wrong endpoint. | Medium | Resolved: read back through the selected JSON pointer |
+| 5 | Patch rules | Replacing the first regex match could rewrite a nested field. | High | Resolved for path rules; legacy rules require one match |
+| 6 | `Start-ServiceProcess` | Regex command splitting can break paths with spaces or complex arguments. | Medium | Open |
+| 7 | `Restart-ServiceProcess` | Stopping by process name could kill a second instance. | High for multi-instance hosts | Resolved: stop only one config-path match |
+| 8 | Catalog fetch | Windows PowerShell 5.1 may use legacy TLS defaults for `Invoke-WebRequest`. | Medium | Open |
+| 9 | Test coverage | Automated tests now cover the priority regressions, but many operational paths remain untested. | Critical for contributors | Partial |
+| 10 | Logging | Append-only with no rotation, no size cap, no structured format and no counters. | Low to Medium | Open |
+| 11 | Candidate fan-out | Every probe instance starts at once: `maxCandidates = 8` means 8 processes and 8 generated files at peak. | Medium on small hosts | Open |
+| 12 | Mutex granularity | The single-instance mutex is keyed on the service name alone, so two supervisors with different configurations for the same service would exclude each other. | Low | Open |
+| 13 | Reachability probe | `Test-UpstreamReachability` hardcodes `1.1.1.1:443`. | Low | Open |
+| 14 | `-ForceSwitch` semantics | Forced mode ignores the *strictly better* rule as documented, but it also skips the cooldown. That combination is easy to misuse. | Low | Open |
+| 15 | Locale assumptions | Timestamps and `yyyyMMddHHmmss` backup names are assumed to be locale independent. Not verified under non-Gregorian calendars or unusual regional settings. | Low | Open |
 
-## Design questions without a good answer yet
+## Design decisions and open questions
 
-1. **Text patching versus parse and re-serialise.** Text patching preserves formatting and
-   comments but requires patterns that are unique by construction. Parse and re-serialise is
-   exact but reformats the file and loses comments. A parser that reports source spans for
-   the values it found would give both properties; that is not built here.
-2. **Stopping a service by name.** A reliable restart wants a process handle, a job object
-   or the platform service manager. Matching on the process name is the weakest link in the
-   whole recovery path.
+1. **Text patching versus parse and re-serialise.** Keep text patching so formatting and
+   comment-like data properties survive, but parse the JSON structure and use source spans
+   for exact object and value paths. New `patchRules` use `path` and `value`; legacy
+   `pattern`/`replacement` rules remain compatible only when each pattern has exactly one
+   match. Duplicate JSON keys, ambiguous endpoint objects and ambiguous legacy matches are
+   rejected before a write.
+2. **Stopping a service without a manager.** Match the executable name and configured
+   configuration path from `Win32_Process.CommandLine`, then stop only the unique PID.
+   If the command line is unavailable or the match is ambiguous, refuse the restart rather
+   than kill every same-named process. A Windows service manager or a process handle carried
+   from launch would provide a stronger ownership boundary.
 3. **What the health score should mean.** Today it is *how many targets answered*. A slow
    but correct target counts exactly like a fast one. Should latency influence the score, or
    stay strictly separate from availability?
@@ -43,8 +48,8 @@ and it is the reason the repository asks for help rather than presenting itself 
 
 ## Where help is most valuable
 
-1. A Pester test suite - see `tests/README.md` for the harness the suite is expected to use.
-   Regression tests for items 1, 3, 5 and 7 would pay for themselves immediately.
-2. Fixes for the High items above.
-3. A decision, and an implementation, for design question 1.
-
+1. Review the Pester suite and add cases for remaining failure modes as they are fixed.
+2. Review the remaining open limitations, especially certificate validation and command-line
+   parsing in the restart path.
+3. The source-span patching decision above is implemented; feedback on its configuration
+   compatibility and failure behavior is useful.
