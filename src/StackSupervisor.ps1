@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Layered supervisor for a local gateway service whose upstream endpoints are unreliable.
@@ -314,6 +314,7 @@ function Get-GatewayScore {
 function Get-ActiveEndpoint {
     param([Parameter(Mandatory)]$Config)
     $selector = Get-Selector -Config $Config
+    if (-not (Test-Path -LiteralPath $Config.service.configPath)) { return $null }
     $text = Read-TextFile -Path $Config.service.configPath
     $block = Get-JsonObjectBlock -Text $text -Tag $selector.Tag -RequireProperty $selector.Required
     if (-not $block) { return $null }
