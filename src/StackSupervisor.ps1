@@ -757,8 +757,13 @@ function Invoke-CandidateMeasurement {
     try {
         for ($i = 0; $i -lt $Candidates.Count; $i++) {
             $port = [int]$test.basePort + $i
-            $blockText = Set-JsonStringPathValue -Text $liveBlock.Text -Path 'tag' -Value ('probe-out-' + $i)
-            $blockText = Update-EndpointBlock -Config $Config -BlockText $blockText -Endpoint $Candidates[$i]
+            try {
+                $blockText = Set-JsonStringPathValue -Text $liveBlock.Text -Path 'tag' -Value ('probe-out-' + $i)
+                $blockText = Update-EndpointBlock -Config $Config -BlockText $blockText -Endpoint $Candidates[$i]
+            } catch {
+                Write-Log -Message ('  cannot build a probe instance for {0} {1}:{2}: {3}' -f $Candidates[$i].Label, $Candidates[$i].Host, $Candidates[$i].Port, $_.Exception.Message) -Path $Config.log
+                continue
+            }
             $document = Expand-Template -Template $template -Tokens @{ index = $i; port = $port; outbound = $blockText }
             $configFile = Join-Path $workDir ('_probe-' + $PID + '-' + $i + '.json')
             Write-TextFile -Path $configFile -Text $document
@@ -939,7 +944,7 @@ function Test-UpstreamReachability {
 }
 
 function Invoke-Failover {
-    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$Reason, [int]$CurrentScore = 0, [switch]$Force)
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$Reason, [int]$CurrentScore = 0, [switch]$Force, [switch]$DryRun)
     $active = Get-ActiveEndpoint -Config $Config
     if (-not $active) { Write-Log -Message 'cannot read the active endpoint; aborting failover' -Path $Config.log; return $false }
     Write-Log -Message ('failover started ({0}); active endpoint {1}:{2}' -f $Reason, $active.Host, $active.Port) -Path $Config.log
@@ -986,6 +991,21 @@ function Invoke-Failover {
     }
     Write-Log -Message 'every candidate failed verification; keeping the last written configuration' -Path $Config.log
     return $false
+}
+
+function Invoke-FailoverGuarded {
+    <#
+        The supervisor runs hidden, so an uncaught exception ends the process without a trace in the
+        log. A failover that throws is treated like one that found nothing: log it, report failure,
+        and let the next round decide again.
+    #>
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$Reason, [int]$CurrentScore = 0, [switch]$Force, [switch]$DryRun)
+    try {
+        return [bool](Invoke-Failover -Config $Config -Reason $Reason -CurrentScore $CurrentScore -Force:$Force -DryRun:$DryRun)
+    } catch {
+        Write-Log -Message ('failover aborted by an unexpected error: {0} (line {1})' -f $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber) -Path $Config.log
+        return $false
+    }
 }
 
 #endregion
@@ -1038,7 +1058,8 @@ while ($true) {
         if ($missing -eq 1) { Write-Log -Message 'service process is not running; deferring to the process keeper' -Path $logPath }
         if ($missing -ge $MissingThreshold) {
             Write-Log -Message ('service missing for {0} rounds and the process keeper has not acted; starting it here' -f $missing) -Path $logPath
-            Start-ServiceProcess -Config $config
+            try { Start-ServiceProcess -Config $config }
+            catch { Write-Log -Message ('could not start the service: ' + $_.Exception.Message) -Path $logPath }
             Start-Sleep -Seconds 5
             try { $startedState = Get-ServiceProcessSnapshot -Config $config }
             catch {
@@ -1062,7 +1083,7 @@ while ($true) {
             if ($failures -gt 0 -or $degraded -gt 0) { Write-Log -Message 'health restored' -Path $logPath }
             $failures = 0; $degraded = 0
             if ($ForceSwitch) {
-                Invoke-Failover -Config $config -Reason 'forced re-selection' -CurrentScore $score -Force | Out-Null
+                Invoke-FailoverGuarded -Config $config -Reason 'forced re-selection' -CurrentScore $score -Force -DryRun:$DryRun | Out-Null
                 break
             }
         }
@@ -1077,7 +1098,7 @@ while ($true) {
             if ($shouldSwitch) {
                 $reason = 'degraded for ' + $degraded + ' rounds'
                 if ($ForceSwitch) { $reason = 'forced re-selection' }
-                if (Invoke-Failover -Config $config -Reason $reason -CurrentScore $score -Force:$ForceSwitch) { $lastSwitch = Get-Date }
+                if (Invoke-FailoverGuarded -Config $config -Reason $reason -CurrentScore $score -Force:$ForceSwitch -DryRun:$DryRun) { $lastSwitch = Get-Date }
                 $degraded = 0
                 if ($ForceSwitch) { break }
             }
@@ -1091,7 +1112,7 @@ while ($true) {
                 } else {
                     $reason = 'failed ' + $failures + ' consecutive rounds'
                     if ($ForceSwitch) { $reason = 'forced re-selection' }
-                    if (Invoke-Failover -Config $config -Reason $reason -CurrentScore $score -Force:$ForceSwitch) { $lastSwitch = Get-Date }
+                    if (Invoke-FailoverGuarded -Config $config -Reason $reason -CurrentScore $score -Force:$ForceSwitch -DryRun:$DryRun) { $lastSwitch = Get-Date }
                     $failures = 0
                     if ($ForceSwitch) { break }
                 }

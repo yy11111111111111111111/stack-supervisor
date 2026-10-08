@@ -46,6 +46,8 @@ BeforeAll {
             processName = 'edge-gateway'
             startCommand = 'C:\edge\edge-gateway.exe --config "{config}"'
             catalog = [pscustomobject]@{ maxCandidates = 8 }
+            probe = [pscustomobject]@{ localPort = 1080; timeoutSec = 2; targets = @([pscustomobject]@{ url = 'https://a.example/x'; expect = 'ok'; plain = $false }) }
+            candidateTest = [pscustomobject]@{ instanceTemplate = '{"port":{port},"outbound":{outbound}}'; basePort = 19001; probeExecutable = 'gateway'; probeArguments = '{config}'; rounds = 1; wantHealthy = 1; probeTimeoutSec = 1 }
         }
         return [pscustomobject]@{ service = $service; log = '' }
     }
@@ -293,5 +295,48 @@ Describe 'Keeper command-line detection' {
 
         $processes += [pscustomobject]@{ ProcessId = 12; CommandLine = 'powershell.exe -File C:\ops\StackKeeper.ps1' }
         Test-KeeperCommandLineMatch -Processes $processes -SelfProcessId 10 -Pattern 'StackKeeper\.ps1' | Should -BeTrue
+    }
+}
+
+Describe 'A failed failover attempt must not end the supervisor' {
+    It 'reports failure instead of throwing when the failover raises an unexpected error' {
+        $config = New-TestConfig
+        Mock Invoke-Failover { throw 'simulated failure inside the failover' }
+        Mock Write-Log {}
+
+        { Invoke-FailoverGuarded -Config $config -Reason 'test' -CurrentScore 0 } | Should -Not -Throw
+        Invoke-FailoverGuarded -Config $config -Reason 'test' -CurrentScore 0 | Should -BeFalse
+        Should -Invoke Write-Log -ParameterFilter { $Message -like '*simulated failure inside the failover*' }
+    }
+
+    It 'passes the failover outcome and its switches through unchanged' {
+        $config = New-TestConfig
+        Mock Invoke-Failover { return $true }
+
+        Invoke-FailoverGuarded -Config $config -Reason 'forced' -CurrentScore 2 -Force -DryRun | Should -BeTrue
+        Should -Invoke Invoke-Failover -Times 1 -Exactly -ParameterFilter {
+            $Force.IsPresent -and $DryRun.IsPresent -and $CurrentScore -eq 2 -and $Reason -eq 'forced'
+        }
+    }
+
+    It 'skips a candidate whose probe instance cannot be built, logs why, and starts nothing' {
+        $live = Join-Path $TestDrive 'probe-live.json'
+        $json = '{"outbounds":[{"tag":"primary","kind":"proxy","target":{"host":"old.example","port":443}}]}'
+        [System.IO.File]::WriteAllText($live, $json, (New-Object System.Text.UTF8Encoding($false)))
+        $rules = @(
+            (New-TestPatchRule -Path 'target.host' -Value '{host}'),
+            (New-TestPatchRule -Path 'tls.serverName' -Value '{attr:sni}')
+        )
+        $config = New-TestConfig -PatchRules $rules
+        $config.service.configPath = $live
+        $candidate = [pscustomobject]@{ Label = 'c1'; Host = 'new.example'; Port = 8443; Fields = @{ host = 'new.example'; port = 8443; sni = 'new.example' } }
+        Mock Start-Process {}
+        Mock Write-Log {}
+
+        $result = @(Invoke-CandidateMeasurement -Config $config -Candidates @($candidate))
+
+        $result.Count | Should -Be 0
+        Should -Invoke Start-Process -Times 0 -Exactly
+        Should -Invoke Write-Log -ParameterFilter { $Message -like '*cannot build a probe instance*tls.serverName*' }
     }
 }
