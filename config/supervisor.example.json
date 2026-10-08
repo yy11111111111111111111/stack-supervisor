@@ -62,7 +62,7 @@
       "//2": "Every query parameter of an endpoint URI becomes an attribute usable as {attr:name} in patchRules.",
       "url": "https://catalog.example.net/endpoints",
       "format": "base64-uri",
-      "//3": "uriPrefix is the URI scheme without the trailing ://, so edge for lines that start with edge://.",
+      "//3": "uriPrefix accepts the URI scheme with or without ://, for example edge or edge://.",
       "uriPrefix": "edge",
       "maxCandidates": 8,
       "regionRank": {

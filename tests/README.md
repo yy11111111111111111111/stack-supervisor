@@ -29,8 +29,8 @@ suite also runs on other hosts.
 |---|---|
 | JSON block discovery | Fixture JSON, including an earlier nested tag reference, escaped strings, duplicate keys and ambiguous endpoint objects; a table of documents the tokenizer must accept and must reject; the reason reported for a syntax error, no match and an ambiguous match. |
 | Patch rules and read-back validation | Temporary fixture files; assert exact path updates, preservation of similarly named nested fields, backup creation, atomic replacement and selected-path validation. A changed file must not be overwritten. Legacy regex rules must be unique. Optional `{attr:}` rules are skipped without needing their path. The read-back must refuse a patch that fixed only the host or only the port. |
-| Health scoring | Mock the probe function (Pester `Mock`) and drive the score table 2 / 1 / 0. Candidate availability is the lowest score across measurement rounds. |
-| Catalog parsing | A base64 URI catalog accepts `uriPrefix` both with and without the trailing `://`. |
+| Health scoring | Mock the probe function (Pester `Mock`) and drive the score table 2 / 1 / 0. Candidate availability is the lowest score across measurement rounds, verified through both the scoring helper and candidate measurement. |
+| Catalog parsing | A base64 URI catalog accepts `uriPrefix` both with and without the trailing `://`; URI-line feeds ignore other schemes, and base64 detection does not confuse the bare scheme text with an already-decoded URI. |
 | Failover decision logic | Mock catalog fetch, candidate measurement and restart; assert that nothing is written when no candidate beats the active score, that a refused restart puts the previous bytes back and is not scored, that the success path keeps the new configuration, and that a failover which throws is reported as a failed attempt. |
 | Process identity | Mock `Get-CimInstance`; assert which process matches the config path (slash direction does not matter) and the reason given for each outcome. |
 | Keeper component detection | Synthetic process-list objects; assert the self-match exclusion. |

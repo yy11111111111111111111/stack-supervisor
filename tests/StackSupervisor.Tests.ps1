@@ -123,15 +123,17 @@ Describe 'JSON source-span selection and patching' {
         $config = New-TestConfig
         $config.service.configPath = $path
         $endpoint = [pscustomobject]@{ Host = 'new.example'; Port = 8443; Fields = @{ host = 'new.example'; port = 8443 } }
-        Mock Write-TextFileAtomically {
+        Mock Read-TextFile {
+            $readText = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
             [System.IO.File]::WriteAllText($Path, $script:concurrentExternal, (New-Object System.Text.UTF8Encoding($false)))
-            return $false
+            return $readText
         }
         Mock Write-Log {}
 
         Set-ActiveEndpoint -Config $config -Endpoint $endpoint | Should -BeFalse
 
         [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) | Should -BeExactly $script:concurrentExternal
+        @((Get-ChildItem -LiteralPath $TestDrive -Force | Where-Object { $_.Name -like '*.tmp' })).Count | Should -Be 0
         Should -Invoke Write-Log -ParameterFilter { $Message -like '*changed after it was read*refusing to overwrite*' }
     }
 
@@ -302,6 +304,36 @@ Describe 'Health scoring and failover decisions' {
         Get-CandidateStableScore -RoundScores @(2, 0) | Should -Be 0
         Get-CandidateStableScore -RoundScores @(2, 2) | Should -Be 2
     }
+
+    It 'uses the lowest score from actual candidate measurement rounds' {
+        $live = Join-Path $TestDrive 'candidate-live.json'
+        $json = '{"outbounds":[{"tag":"primary","kind":"proxy","target":{"host":"old.example","port":443}}]}'
+        [System.IO.File]::WriteAllText($live, $json, (New-Object System.Text.UTF8Encoding($false)))
+        $config = New-TestConfig
+        $config.service.configPath = $live
+        $config.service.candidateTest.rounds = 3
+        $candidate = [pscustomobject]@{ Label = 'c1'; Host = 'new.example'; Port = 8443; Fields = @{ host = 'new.example'; port = 8443 } }
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, [int]$config.service.candidateTest.basePort)
+        $listener.Start()
+        $script:measurementResults = New-Object System.Collections.Queue
+        $script:measurementResults.Enqueue($true)
+        $script:measurementResults.Enqueue($false)
+        $script:measurementResults.Enqueue($true)
+        Mock Start-Process { return [pscustomobject]@{ HasExited = $false; Id = 99999 } }
+        Mock Stop-Process {}
+        Mock Test-HealthTarget { return [bool]$script:measurementResults.Dequeue() }
+        Mock Write-Log {}
+
+        try {
+            $result = @(Invoke-CandidateMeasurement -Config $config -Candidates @($candidate))
+
+            $result.Count | Should -Be 0
+            $script:measurementResults.Count | Should -Be 0
+            Should -Invoke Test-HealthTarget -Times 3 -Exactly
+        } finally {
+            $listener.Stop()
+        }
+    }
 }
 
 Describe 'Catalog URI prefix compatibility' {
@@ -325,6 +357,57 @@ Describe 'Catalog URI prefix compatibility' {
         $endpoints[0].Host | Should -Be 'example.net'
         $endpoints[0].Port | Should -Be 443
         $endpoints[0].Fields.region | Should -Be 'hk'
+    }
+
+    It 'parses uri-lines with a trimmed prefix and ignores other schemes' {
+        $catalogPath = Join-Path $TestDrive 'catalog-lines.txt'
+        $lines = "other://token@ignored.example:443?region=us#Other`nedge://token@example.net:443?region=hk#HongKong"
+        [System.IO.File]::WriteAllText($catalogPath, $lines, (New-Object System.Text.UTF8Encoding($false)))
+        $config = New-TestConfig
+        $config.service.catalog = [pscustomobject]@{
+            file = $catalogPath; format = 'uri-lines'; uriPrefix = ' edge:// '; maxCandidates = 8
+        }
+
+        $endpoints = @(Get-CatalogEndpoints -Config $config)
+
+        $endpoints.Count | Should -Be 1
+        $endpoints[0].Host | Should -Be 'example.net'
+        $endpoints[0].Label | Should -Be 'HongKong'
+    }
+
+    It 'decodes a base64 catalog even when its encoded text contains the bare scheme' {
+        $catalogPath = Join-Path $TestDrive 'catalog-bare-scheme-in-base64.txt'
+        $uri = 'edge://token@example.net:443?region=hk#HongKong'
+        $uriBytes = [System.Text.Encoding]::UTF8.GetBytes($uri)
+        # This valid UTF-8 prefix makes the base64 text contain "edge" before any URI line.
+        $prefixBytes = [Convert]::FromBase64String('CuedgeKg')
+        $payload = [byte[]]($prefixBytes + @(0x0A) + $uriBytes)
+        $encoded = [Convert]::ToBase64String($payload)
+        $encoded.Contains('edge') | Should -BeTrue
+        $encoded.Contains('edge://') | Should -BeFalse
+        [System.IO.File]::WriteAllText($catalogPath, $encoded, (New-Object System.Text.UTF8Encoding($false)))
+        $config = New-TestConfig
+        $config.service.catalog = [pscustomobject]@{
+            file = $catalogPath; format = 'base64-uri'; uriPrefix = 'edge'; maxCandidates = 8
+        }
+
+        $endpoints = @(Get-CatalogEndpoints -Config $config)
+
+        $endpoints.Count | Should -Be 1
+        $endpoints[0].Host | Should -Be 'example.net'
+    }
+
+    It 'rejects an empty URI scheme with a diagnostic' {
+        $catalogPath = Join-Path $TestDrive 'catalog-empty-prefix.txt'
+        [System.IO.File]::WriteAllText($catalogPath, 'edge://token@example.net:443?region=hk#HongKong', (New-Object System.Text.UTF8Encoding($false)))
+        $config = New-TestConfig
+        $config.service.catalog = [pscustomobject]@{
+            file = $catalogPath; format = 'base64-uri'; uriPrefix = '  '; maxCandidates = 8
+        }
+        Mock Write-Log {}
+
+        @(Get-CatalogEndpoints -Config $config).Count | Should -Be 0
+        Should -Invoke Write-Log -ParameterFilter { $Message -like '*uriPrefix must name a URI scheme*' }
     }
 }
 
