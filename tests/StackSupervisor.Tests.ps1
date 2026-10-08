@@ -120,7 +120,12 @@ Describe 'JSON source-span selection and patching' {
         $backupDir = Join-Path $TestDrive 'ambiguous-backups'
         $json = '{"outbounds":[{"tag":"primary","kind":"proxy","target":{"host":"old.example","port":443},"fallback":{"host":"keep.example"}}]}'
         [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
-        $rules = @([pscustomobject]@{ pattern = '"host"\s*:\s*"[^"]*"'; replacement = '"host": "{host}"' })
+        # The port rule is correct and unique, and the first host match happens to be the right one. Without the
+        # ambiguity guard this patch would therefore pass the read-back and be written.
+        $rules = @(
+            [pscustomobject]@{ pattern = '"host"\s*:\s*"[^"]*"'; replacement = '"host": "{host}"' },
+            [pscustomobject]@{ pattern = '"port"\s*:\s*\d+'; replacement = '"port": {port}' }
+        )
         $config = New-TestConfig -PatchRules $rules
         $config.service.configPath = $path
         $config.service.backupDir = $backupDir
@@ -130,6 +135,30 @@ Describe 'JSON source-span selection and patching' {
         Set-ActiveEndpoint -Config $config -Endpoint $endpoint | Should -BeFalse
         [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) | Should -BeExactly $json
         Test-Path -LiteralPath $backupDir | Should -BeFalse
+        Should -Invoke Write-Log -ParameterFilter { $Message -like '*must match exactly once*' }
+    }
+
+    It 'refuses to write when the read-back does not match the requested endpoint (<Name>)' -TestCases @(
+        @{ Name = 'only the host was patched'; Rule = 'target.host'; Template = '{host}' },
+        @{ Name = 'only the port was patched'; Rule = 'target.port'; Template = '{port}' }
+    ) {
+        $path = Join-Path $TestDrive 'readback.json'
+        $backupDir = Join-Path $TestDrive 'readback-backups'
+        $json = '{"outbounds":[{"tag":"primary","kind":"proxy","target":{"host":"old.example","port":443}}]}'
+        [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
+        # The patched text is valid and the endpoint object is found, but the fields read back from it are not
+        # the endpoint that was asked for. Only the host/port comparison can stop this write.
+        $config = New-TestConfig -PatchRules @((New-TestPatchRule -Path $Rule -Value $Template))
+        $config.service.configPath = $path
+        $config.service.backupDir = $backupDir
+        $endpoint = [pscustomobject]@{ Host = 'new.example'; Port = 8443; Fields = @{ host = 'new.example'; port = 8443 } }
+        Mock Write-Log {}
+
+        Set-ActiveEndpoint -Config $config -Endpoint $endpoint | Should -BeFalse
+
+        [System.IO.File]::ReadAllText($path) | Should -BeExactly $json
+        Test-Path -LiteralPath $backupDir | Should -BeFalse
+        Should -Invoke Write-Log -ParameterFilter { $Message -like 'read-back validation failed*' }
     }
 }
 
