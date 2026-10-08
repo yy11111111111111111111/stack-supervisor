@@ -468,3 +468,193 @@ Describe 'Failover when the service restart does not complete' {
         Should -Invoke Restart-ServiceProcess -Times 2 -Exactly
     }
 }
+
+Describe 'JSON selection edge cases' {
+    It 'accepts an empty property name' {
+        $json = '{"":1,"outbounds":[{"tag":"primary","kind":"proxy"}]}'
+
+        $block = Get-JsonObjectBlock -Text $json -Tag 'primary' -RequireProperty @('kind')
+
+        $block.Path | Should -Be '/outbounds/0'
+    }
+
+    It 'resolves the root pointer, so an endpoint object that is the whole document can be read back' {
+        $json = '{"tag":"primary","kind":"proxy"}'
+        $tree = Get-JsonDocumentTree -Text $json
+
+        (Get-JsonNodeByPointer -Root $tree -Pointer '').Kind | Should -Be 'Object'
+        (Get-JsonObjectBlock -Text $json -Tag 'primary' -RequireProperty @('kind')).Path | Should -Be ''
+    }
+
+    It 'round-trips pointers for property names that contain a slash or a tilde' {
+        $tree = Get-JsonDocumentTree -Text '{"a/b":{"tag":"primary","kind":"x"},"c~d":[{"tag":"primary","kind":"y"}]}'
+
+        foreach ($node in @(Get-JsonObjectNodes -Node $tree)) {
+            $back = Get-JsonNodeByPointer -Root $tree -Pointer $node.Path
+            $back.Start | Should -Be $node.Start
+            $back.End | Should -Be $node.End
+        }
+    }
+
+    It 'returns strings without escape sequences verbatim, even when they look like dates' {
+        $tree = Get-JsonDocumentTree -Text '{"d":"2024-01-02T03:04:05Z","s":"plain"}'
+
+        $tree.Members[0].Node.Value | Should -BeExactly '2024-01-02T03:04:05Z'
+        $tree.Members[1].Node.Value | Should -BeExactly 'plain'
+    }
+
+    It 'still decodes escape sequences' {
+        $tree = Get-JsonDocumentTree -Text '{"k":"a\"b\\c\u00e9\n"}'
+
+        $tree.Members[0].Node.Value | Should -BeExactly ("a`"b\c" + [char]0xE9 + "`n")
+    }
+}
+
+Describe 'JSON selection diagnostics' {
+    It 'explains a syntax error with its line and column' {
+        $why = ''
+        $json = "{`n  `"outbounds`": [`n    { /* note */ `"tag`": `"primary`" }`n  ]`n}"
+
+        Get-JsonObjectBlock -Text $json -Tag 'primary' -Reason ([ref]$why) | Should -BeNullOrEmpty
+
+        $why | Should -BeExactly 'JSON syntax error at line 3, column 7: expected a JSON string'
+    }
+
+    It 'reports an empty document as a syntax error instead of failing to bind' {
+        $why = ''
+
+        Get-JsonObjectBlock -Text '' -Tag 'primary' -Reason ([ref]$why) | Should -BeNullOrEmpty
+
+        $why | Should -BeLike 'JSON syntax error at line 1, column 1: *'
+    }
+
+    It 'explains that no object matches' {
+        $why = ''
+        $json = '{"outbounds":[{"tag":"other","kind":"proxy"},{"tag":"primary"}]}'
+
+        Get-JsonObjectBlock -Text $json -Tag 'primary' -RequireProperty @('kind') -Reason ([ref]$why) | Should -BeNullOrEmpty
+
+        $why | Should -BeExactly "no JSON object has tag 'primary' with the properties kind"
+    }
+
+    It 'explains an ambiguous match by listing the paths' {
+        $why = ''
+        $json = '{"a":{"tag":"primary","kind":"x"},"b":{"tag":"primary","kind":"y"}}'
+
+        Get-JsonObjectBlock -Text $json -Tag 'primary' -RequireProperty @('kind') -Reason ([ref]$why) | Should -BeNullOrEmpty
+
+        $why | Should -BeExactly "2 JSON objects have tag 'primary' with the properties kind (paths /a, /b); refusing to choose one"
+    }
+
+    It 'still works when the caller does not ask for a reason' {
+        Get-JsonObjectBlock -Text '{"tag":"primary"}' -Tag 'primary' | Should -Not -BeNullOrEmpty
+        Get-JsonObjectBlock -Text '{' -Tag 'primary' | Should -BeNullOrEmpty
+    }
+
+    It 'logs why the active endpoint cannot be read' {
+        $path = Join-Path $TestDrive 'unreadable.json'
+        [System.IO.File]::WriteAllText($path, '{"outbounds":[{"tag":"primary","kind":"proxy",}]}', (New-Object System.Text.UTF8Encoding($false)))
+        $config = New-TestConfig
+        $config.service.configPath = $path
+        Mock Write-Log {}
+
+        Get-ActiveEndpoint -Config $config | Should -BeNullOrEmpty
+
+        Should -Invoke Write-Log -ParameterFilter { $Message -like 'active endpoint not found: JSON syntax error at line 1, column *' }
+    }
+
+    It 'logs when the configured read fields do not resolve in the endpoint object' {
+        $path = Join-Path $TestDrive 'nofields.json'
+        [System.IO.File]::WriteAllText($path, '{"outbounds":[{"tag":"primary","kind":"proxy","target":{"address":"old.example"}}]}', (New-Object System.Text.UTF8Encoding($false)))
+        $config = New-TestConfig
+        $config.service.configPath = $path
+        Mock Write-Log {}
+
+        Get-ActiveEndpoint -Config $config | Should -BeNullOrEmpty
+
+        Should -Invoke Write-Log -ParameterFilter { $Message -like '*readFields*did not resolve*/outbounds/0*' }
+    }
+
+    It 'logs the reason when a configuration write is refused' {
+        $path = Join-Path $TestDrive 'refused.json'
+        $json = '{"a":{"tag":"primary","kind":"x"},"b":{"tag":"primary","kind":"y"}}'
+        [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
+        $config = New-TestConfig
+        $config.service.configPath = $path
+        $endpoint = [pscustomobject]@{ Host = 'new.example'; Port = 8443; Fields = @{ host = 'new.example'; port = 8443 } }
+        Mock Write-Log {}
+
+        Set-ActiveEndpoint -Config $config -Endpoint $endpoint | Should -BeFalse
+
+        Should -Invoke Write-Log -ParameterFilter { $Message -like 'endpoint block not found; refusing to write: 2 JSON objects have tag*' }
+        [System.IO.File]::ReadAllText($path) | Should -BeExactly $json
+    }
+
+    It 'logs the reason when probe instances cannot be built' {
+        $path = Join-Path $TestDrive 'noprobe.json'
+        [System.IO.File]::WriteAllText($path, '{"outbounds":[{"tag":"other","kind":"proxy"}]}', (New-Object System.Text.UTF8Encoding($false)))
+        $config = New-TestConfig
+        $config.service.configPath = $path
+        $candidate = [pscustomobject]@{ Label = 'c1'; Host = 'new.example'; Port = 8443; Fields = @{ host = 'new.example'; port = 8443 } }
+        Mock Start-Process {}
+        Mock Write-Log {}
+
+        @(Invoke-CandidateMeasurement -Config $config -Candidates @($candidate)).Count | Should -Be 0
+
+        Should -Invoke Write-Log -ParameterFilter { $Message -like "cannot build probe instances: endpoint block not found: no JSON object has tag 'primary'*" }
+    }
+}
+
+Describe 'JSON syntax accepted and rejected by the tokenizer' {
+    It 'accepts <Name>' -TestCases @(
+        @{ Name = 'an empty object'; Json = '{}' },
+        @{ Name = 'an empty array'; Json = '[]' },
+        @{ Name = 'a bare string'; Json = '"x"' },
+        @{ Name = 'zero'; Json = '0' },
+        @{ Name = 'negative zero'; Json = '-0' },
+        @{ Name = 'exponents and fractions'; Json = '[1E5,-2.5e-3,0.0,1e+2]' },
+        @{ Name = 'the three literals'; Json = '[true,false,null]' },
+        @{ Name = 'nesting'; Json = '{"a":[{"b":[[]]}]}' },
+        @{ Name = 'every simple escape'; Json = '"\"\\\/\b\f\n\r\t"' },
+        @{ Name = 'a unicode escape'; Json = '"\u00e9"' },
+        @{ Name = 'a surrogate pair written as escapes'; Json = '"\ud83d\ude00"' },
+        @{ Name = 'whitespace around the value'; Json = " `t`r`n{ } `n" },
+        @{ Name = 'an empty property name'; Json = '{"":0}' }
+    ) {
+        { Get-JsonDocumentTree -Text $Json } | Should -Not -Throw
+    }
+
+    It 'rejects <Name>' -TestCases @(
+        @{ Name = 'empty text'; Json = '' },
+        @{ Name = 'whitespace only'; Json = '  ' },
+        @{ Name = 'a line comment'; Json = '{} // c' },
+        @{ Name = 'a block comment'; Json = '/* c */ {}' },
+        @{ Name = 'a trailing comma in an object'; Json = '{"a":1,}' },
+        @{ Name = 'a trailing comma in an array'; Json = '[1,]' },
+        @{ Name = 'a leading comma'; Json = '[,1]' },
+        @{ Name = 'single quotes'; Json = "{'a':1}" },
+        @{ Name = 'an unquoted key'; Json = '{a:1}' },
+        @{ Name = 'a missing colon'; Json = '{"a" 1}' },
+        @{ Name = 'a leading zero'; Json = '01' },
+        @{ Name = 'a plus sign'; Json = '+1' },
+        @{ Name = 'a trailing dot'; Json = '1.' },
+        @{ Name = 'a leading dot'; Json = '.5' },
+        @{ Name = 'a lone minus'; Json = '-' },
+        @{ Name = 'an exponent without digits'; Json = '1e' },
+        @{ Name = 'a literal in the wrong case'; Json = 'trUE' },
+        @{ Name = 'a truncated literal'; Json = 'nul' },
+        @{ Name = 'NaN'; Json = 'NaN' },
+        @{ Name = 'content after the value'; Json = '{} {}' },
+        @{ Name = 'an unterminated string'; Json = '"abc' },
+        @{ Name = 'an unterminated object'; Json = '{"a":1' },
+        @{ Name = 'an unterminated array'; Json = '[1' },
+        @{ Name = 'a raw tab inside a string'; Json = ('"a' + [char]9 + 'b"') },
+        @{ Name = 'an unknown escape'; Json = '"\x"' },
+        @{ Name = 'a short unicode escape'; Json = '"\u12"' },
+        @{ Name = 'a non-hex unicode escape'; Json = '"\u12G4"' },
+        @{ Name = 'an upper-case unicode escape'; Json = '"\U0041"' },
+        @{ Name = 'a duplicated property name'; Json = '{"a":1,"a":2}' }
+    ) {
+        { Get-JsonDocumentTree -Text $Json } | Should -Throw
+    }
+}

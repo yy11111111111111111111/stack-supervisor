@@ -124,6 +124,7 @@ function Read-JsonStringToken {
     $start = $State.Index
     $State.Index++
     $closed = $false
+    $hasEscape = $false
     while ($State.Index -lt $State.Text.Length) {
         $ch = $State.Text[$State.Index]
         if ($ch -eq '"') {
@@ -133,6 +134,7 @@ function Read-JsonStringToken {
         }
         if ([int]$ch -lt 32) { throw 'unescaped control character in JSON string' }
         if ($ch -eq [char]92) {
+            $hasEscape = $true
             $State.Index++
             if ($State.Index -ge $State.Text.Length) { throw 'incomplete JSON escape' }
             $escaped = $State.Text[$State.Index]
@@ -151,13 +153,18 @@ function Read-JsonStringToken {
         $State.Index++
     }
     if (-not $closed) { throw 'unterminated JSON string' }
-    $raw = $State.Text.Substring($start, $State.Index - $start)
-    $value = ConvertFrom-Json -InputObject $raw -ErrorAction Stop
-    return [pscustomobject]@{ Start = $start; End = $State.Index; Value = [string]$value }
+    if ($hasEscape) {
+        $raw = $State.Text.Substring($start, $State.Index - $start)
+        $value = [string](ConvertFrom-Json -InputObject $raw -ErrorAction Stop)
+    } else {
+        # ConvertFrom-Json would turn text such as 2024-01-02T03:04:05Z into a [datetime] on PowerShell 7.
+        $value = $State.Text.Substring($start + 1, $State.Index - $start - 2)
+    }
+    return [pscustomobject]@{ Start = $start; End = $State.Index; Value = $value }
 }
 
 function ConvertTo-JsonPointerSegment {
-    param([Parameter(Mandatory)][string]$Segment)
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Segment)
     return $Segment.Replace('~', '~0').Replace('/', '~1')
 }
 
@@ -242,15 +249,29 @@ function Read-JsonValueToken {
         $State.Index += $number.Length
         return [pscustomobject]@{ Kind = 'Number'; Start = $start; End = $State.Index; Path = $Path; Value = $number.Value; Members = @(); Items = @() }
     }
-    throw ('invalid JSON value at offset ' + $State.Index)
+    throw 'invalid JSON value'
+}
+
+function Get-JsonErrorLocation {
+    <# Turns a character offset into 'line L, column C' for messages. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [int]$Offset)
+    if ($Offset -lt 0) { $Offset = 0 }
+    if ($Offset -gt $Text.Length) { $Offset = $Text.Length }
+    $lines = $Text.Substring(0, $Offset).Split([char]10)
+    return ('line {0}, column {1}' -f $lines.Length, ($lines[$lines.Length - 1].Length + 1))
 }
 
 function Get-JsonDocumentTree {
-    param([Parameter(Mandatory)][string]$Text)
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
     $state = @{ Text = $Text; Index = 0 }
-    $root = Read-JsonValueToken -State $state
-    Skip-JsonWhitespace -State $state
-    if ($state.Index -ne $Text.Length) { throw ('unexpected content after JSON value at offset ' + $state.Index) }
+    try {
+        $root = Read-JsonValueToken -State $state
+        Skip-JsonWhitespace -State $state
+        if ($state.Index -ne $Text.Length) { throw 'unexpected content after the JSON value' }
+    } catch {
+        $detail = $_.Exception.Message
+        throw ('JSON syntax error at {0}: {1}' -f (Get-JsonErrorLocation -Text $Text -Offset $state.Index), $detail)
+    }
     return $root
 }
 
@@ -282,7 +303,7 @@ function Get-JsonPathNode {
 }
 
 function Get-JsonNodeByPointer {
-    param([Parameter(Mandatory)]$Root, [Parameter(Mandatory)][string]$Pointer)
+    param([Parameter(Mandatory)]$Root, [Parameter(Mandatory)][AllowEmptyString()][string]$Pointer)
     if (-not $Pointer) { return $Root }
     if (-not $Pointer.StartsWith('/')) { return $null }
     $current = $Root
@@ -311,14 +332,23 @@ function Get-JsonObjectNodes {
 }
 
 function Get-JsonObjectBlock {
-    <# Finds exactly one JSON object with a direct tag property and all required siblings. #>
+    <#
+        Finds exactly one JSON object with a direct tag property and all required siblings, or returns $null.
+        -Reason receives the explanation for a $null result (syntax error with its position, no match, or the
+        paths of an ambiguous match) so that callers can log why.
+    #>
     param(
-        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
         [Parameter(Mandatory)][string]$Tag,
-        [string[]]$RequireProperty = @()
+        [string[]]$RequireProperty = @(),
+        [ref]$Reason
     )
-    try { $root = Get-JsonDocumentTree -Text $Text } catch { return $null }
-    $matches = New-Object System.Collections.ArrayList
+    try { $root = Get-JsonDocumentTree -Text $Text }
+    catch {
+        if ($Reason) { $Reason.Value = $_.Exception.Message }
+        return $null
+    }
+    $found = New-Object System.Collections.ArrayList
     foreach ($candidate in @(Get-JsonObjectNodes -Node $root)) {
         $tagNode = Get-JsonMemberNode -Node $candidate -Name 'tag'
         if (-not $tagNode -or $tagNode.Kind -ne 'String' -or $tagNode.Value -cne $Tag) { continue }
@@ -326,10 +356,22 @@ function Get-JsonObjectBlock {
         foreach ($property in $RequireProperty) {
             if (-not (Get-JsonMemberNode -Node $candidate -Name ([string]$property))) { $accepted = $false; break }
         }
-        if ($accepted) { $matches.Add($candidate) | Out-Null }
+        if ($accepted) { $found.Add($candidate) | Out-Null }
     }
-    if ($matches.Count -ne 1) { return $null }
-    $object = $matches[0]
+    if ($found.Count -ne 1) {
+        if ($Reason) {
+            $needs = ''
+            if (@($RequireProperty).Count -gt 0) { $needs = ' with the properties ' + (@($RequireProperty) -join ', ') }
+            if ($found.Count -eq 0) {
+                $Reason.Value = "no JSON object has tag '$Tag'$needs"
+            } else {
+                $paths = @($found | ForEach-Object { $_.Path }) -join ', '
+                $Reason.Value = "$($found.Count) JSON objects have tag '$Tag'$needs (paths $paths); refusing to choose one"
+            }
+        }
+        return $null
+    }
+    $object = $found[0]
     return [pscustomobject]@{
         Start = $object.Start
         End = $object.End
@@ -525,16 +567,26 @@ function Get-GatewayScore {
 function Get-ActiveEndpoint {
     param([Parameter(Mandatory)]$Config)
     $selector = Get-Selector -Config $Config
-    if (-not (Test-Path -LiteralPath $Config.service.configPath)) { return $null }
+    if (-not (Test-Path -LiteralPath $Config.service.configPath)) {
+        Write-Log -Message ('configuration file not found: ' + $Config.service.configPath) -Path $Config.log
+        return $null
+    }
     $text = Read-TextFile -Path $Config.service.configPath
-    $block = Get-JsonObjectBlock -Text $text -Tag $selector.Tag -RequireProperty $selector.Required
-    if (-not $block) { return $null }
+    $why = ''
+    $block = Get-JsonObjectBlock -Text $text -Tag $selector.Tag -RequireProperty $selector.Required -Reason ([ref]$why)
+    if (-not $block) {
+        Write-Log -Message ('active endpoint not found: ' + $why) -Path $Config.log
+        return $null
+    }
     $object = $block.Text | ConvertFrom-Json
     $fields = @{}
     foreach ($property in $selector.Read.PSObject.Properties) {
         $fields[$property.Name] = Get-JsonPathValue -Object $object -Path ([string]$property.Value)
     }
-    if (-not $fields.ContainsKey('host') -or -not $fields.ContainsKey('port')) { return $null }
+    if (-not $fields.ContainsKey('host') -or -not $fields.ContainsKey('port') -or $null -eq $fields['host'] -or $null -eq $fields['port']) {
+        Write-Log -Message ('readFields host/port did not resolve in the endpoint object at ' + $block.Path) -Path $Config.log
+        return $null
+    }
     return [pscustomobject]@{ Host = [string]$fields['host']; Port = [int]$fields['port']; Fields = $fields }
 }
 
@@ -620,8 +672,9 @@ function Set-ActiveEndpoint {
     $path = $Config.service.configPath
     $selector = Get-Selector -Config $Config
     $text = Read-TextFile -Path $path
-    $block = Get-JsonObjectBlock -Text $text -Tag $selector.Tag -RequireProperty $selector.Required
-    if (-not $block) { Write-Log -Message 'endpoint block not found; refusing to write' -Path $Config.log; return $false }
+    $why = ''
+    $block = Get-JsonObjectBlock -Text $text -Tag $selector.Tag -RequireProperty $selector.Required -Reason ([ref]$why)
+    if (-not $block) { Write-Log -Message ('endpoint block not found; refusing to write: ' + $why) -Path $Config.log; return $false }
 
     try {
         $updated = $text.Substring(0, $block.Start) + (Update-EndpointBlock -Config $Config -BlockText $block.Text -Endpoint $Endpoint) + $text.Substring($block.End)
@@ -749,8 +802,9 @@ function Invoke-CandidateMeasurement {
     if (-not $template) { Write-Log -Message 'candidateTest.instanceTemplate or instanceTemplateFile is required' -Path $Config.log; return @() }
 
     $liveText = Read-TextFile -Path $Config.service.configPath
-    $liveBlock = Get-JsonObjectBlock -Text $liveText -Tag $selector.Tag -RequireProperty $selector.Required
-    if (-not $liveBlock) { Write-Log -Message 'cannot build probe instances: endpoint block not found' -Path $Config.log; return @() }
+    $why = ''
+    $liveBlock = Get-JsonObjectBlock -Text $liveText -Tag $selector.Tag -RequireProperty $selector.Required -Reason ([ref]$why)
+    if (-not $liveBlock) { Write-Log -Message ('cannot build probe instances: endpoint block not found: ' + $why) -Path $Config.log; return @() }
 
     $workDir = [System.IO.Path]::GetDirectoryName($Config.service.configPath)
     $targets = Get-HealthTargets -Config $Config
