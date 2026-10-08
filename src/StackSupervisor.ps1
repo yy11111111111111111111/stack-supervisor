@@ -84,6 +84,47 @@ function Write-TextFile {
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Replace-FileBytesAtomically {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [byte[]]$ExpectedBytes
+    )
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $directory = [System.IO.Path]::GetDirectoryName($fullPath)
+    $name = [System.IO.Path]::GetFileName($fullPath)
+    $temporary = Join-Path $directory ('.' + $name + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $temporaryBackup = $temporary + '.previous'
+    try {
+        [System.IO.File]::WriteAllBytes($temporary, $Bytes)
+        if ($null -ne $ExpectedBytes) {
+            $currentBytes = [System.IO.File]::ReadAllBytes($fullPath)
+            $same = $currentBytes.Length -eq $ExpectedBytes.Length
+            if ($same) {
+                for ($i = 0; $i -lt $currentBytes.Length; $i++) {
+                    if ($currentBytes[$i] -ne $ExpectedBytes[$i]) { $same = $false; break }
+                }
+            }
+            if (-not $same) { return $false }
+        }
+        [System.IO.File]::Replace($temporary, $fullPath, $temporaryBackup)
+        return $true
+    } finally {
+        foreach ($temporaryPath in @($temporary, $temporaryBackup)) {
+            if (Test-Path -LiteralPath $temporaryPath) {
+                Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+function Write-TextFileAtomically {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Text, [byte[]]$ExpectedBytes)
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    $bytes = $encoding.GetBytes($Text)
+    return Replace-FileBytesAtomically -Path $Path -Bytes $bytes -ExpectedBytes $ExpectedBytes
+}
+
 #endregion
 
 #region ------------------------------------------------------------------- json
@@ -231,20 +272,28 @@ function Read-JsonValueToken {
         return [pscustomobject]@{ Kind = 'String'; Start = $string.Start; End = $string.End; Path = $Path; Value = $string.Value; Members = @(); Items = @() }
     }
 
-    $remaining = $State.Text.Substring($State.Index)
-    if ($remaining.StartsWith('true', [System.StringComparison]::Ordinal)) {
+    if ($ch -eq 't' -and $State.Index + 4 -le $State.Text.Length -and $State.Text.Substring($State.Index, 4) -ceq 'true') {
         $State.Index += 4
         return [pscustomobject]@{ Kind = 'Boolean'; Start = $start; End = $State.Index; Path = $Path; Value = $true; Members = @(); Items = @() }
     }
-    if ($remaining.StartsWith('false', [System.StringComparison]::Ordinal)) {
+    if ($ch -eq 'f' -and $State.Index + 5 -le $State.Text.Length -and $State.Text.Substring($State.Index, 5) -ceq 'false') {
         $State.Index += 5
         return [pscustomobject]@{ Kind = 'Boolean'; Start = $start; End = $State.Index; Path = $Path; Value = $false; Members = @(); Items = @() }
     }
-    if ($remaining.StartsWith('null', [System.StringComparison]::Ordinal)) {
+    if ($ch -eq 'n' -and $State.Index + 4 -le $State.Text.Length -and $State.Text.Substring($State.Index, 4) -ceq 'null') {
         $State.Index += 4
         return [pscustomobject]@{ Kind = 'Null'; Start = $start; End = $State.Index; Path = $Path; Value = $null; Members = @(); Items = @() }
     }
-    $number = [regex]::Match($remaining, '^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?')
+    $tokenEnd = $State.Index
+    while ($tokenEnd -lt $State.Text.Length) {
+        $tokenChar = $State.Text[$tokenEnd]
+        $tokenCode = [int]$tokenChar
+        if ($tokenCode -eq 9 -or $tokenCode -eq 10 -or $tokenCode -eq 13 -or $tokenCode -eq 32 -or
+            $tokenChar -eq ',' -or $tokenChar -eq ']' -or $tokenChar -eq '}') { break }
+        $tokenEnd++
+    }
+    $numberText = $State.Text.Substring($State.Index, $tokenEnd - $State.Index)
+    $number = [regex]::Match($numberText, '^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?')
     if ($number.Success) {
         $State.Index += $number.Length
         return [pscustomobject]@{ Kind = 'Number'; Start = $start; End = $State.Index; Path = $Path; Value = $number.Value; Members = @(); Items = @() }
@@ -671,6 +720,7 @@ function Set-ActiveEndpoint {
     param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)]$Endpoint)
     $path = $Config.service.configPath
     $selector = Get-Selector -Config $Config
+    $originalBytes = [System.IO.File]::ReadAllBytes([string]$path)
     $text = Read-TextFile -Path $path
     $why = ''
     $block = Get-JsonObjectBlock -Text $text -Tag $selector.Tag -RequireProperty $selector.Required -Reason ([ref]$why)
@@ -700,11 +750,19 @@ function Set-ActiveEndpoint {
     if ($backupDir) {
         if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
         $stamp = Get-Date -Format 'yyyyMMddHHmmss'
-        Copy-Item -LiteralPath $path -Destination (Join-Path $backupDir ('config-' + $stamp + '.json')) -Force
+        [System.IO.File]::WriteAllBytes((Join-Path $backupDir ('config-' + $stamp + '.json')), $originalBytes)
         Get-ChildItem -LiteralPath $backupDir -Filter 'config-*.json' | Sort-Object LastWriteTime -Descending |
             Select-Object -Skip 10 | Remove-Item -Force -ErrorAction SilentlyContinue
     }
-    Write-TextFile -Path $path -Text $updated
+    try { $written = Write-TextFileAtomically -Path $path -Text $updated -ExpectedBytes $originalBytes }
+    catch {
+        Write-Log -Message ('could not atomically replace the configuration: ' + $_.Exception.Message) -Path $Config.log
+        return $false
+    }
+    if (-not $written) {
+        Write-Log -Message 'configuration changed after it was read; refusing to overwrite it' -Path $Config.log
+        return $false
+    }
     return $true
 }
 
@@ -731,15 +789,20 @@ function Get-CatalogEndpoints {
         $raw = $response.Content
     }
     $raw = $raw.Trim()
-    $scheme = [string]$feed.uriPrefix
-    if ($feed.format -eq 'base64-uri' -and $raw -notmatch [regex]::Escape($scheme)) {
+    $scheme = ([string]$feed.uriPrefix).Trim()
+    if ($scheme.EndsWith('://', [System.StringComparison]::Ordinal)) {
+        $scheme = $scheme.Substring(0, $scheme.Length - 3)
+    }
+    if (-not $scheme) { Write-Log -Message 'catalog uriPrefix must name a URI scheme' -Path $Config.log; return @() }
+    $schemePattern = [regex]::Escape($scheme) + '://'
+    if ($feed.format -eq 'base64-uri' -and $raw -notmatch $schemePattern) {
         $raw = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($raw))
     }
 
     $endpoints = @()
-    $pattern = '^' + [regex]::Escape($scheme) + '://[^@]+@([^:]+):(\d+)\?(.+)$'
+    $pattern = '^' + $schemePattern + '[^@]+@([^:]+):(\d+)\?(.+)$'
     foreach ($line in ($raw -split '\s+')) {
-        if (-not $line.StartsWith($scheme)) { continue }
+        if (-not $line.StartsWith($scheme + '://', [System.StringComparison]::Ordinal)) { continue }
         if ($line -notmatch $pattern) { continue }
         $hostName = $Matches[1]; $port = [int]$Matches[2]; $rest = $Matches[3]
         $label = ''
@@ -773,6 +836,16 @@ function Get-EndpointRank {
 
 #region -------------------------------------------------- isolated candidate test
 
+function Get-CandidateStableScore {
+    param([int[]]$RoundScores = @())
+    if (-not $RoundScores -or $RoundScores.Count -eq 0) { return 0 }
+    $score = [int]::MaxValue
+    foreach ($roundScore in $RoundScores) {
+        if ($roundScore -lt $score) { $score = $roundScore }
+    }
+    return $score
+}
+
 function Invoke-CandidateMeasurement {
     <#
         Measures candidates without touching the live service.
@@ -784,8 +857,8 @@ function Invoke-CandidateMeasurement {
         configuration is not touched until a winner has been chosen, probing candidates can
         never take production traffic down.
 
-        Ranking uses the sum of both rounds. A single sample is dominated by noise: one such
-        sample once promoted the endpoint with the worst true latency in the candidate set.
+        The availability score is the lowest score across rounds, so a single good sample
+        cannot hide an unstable candidate. Ties are ranked by total elapsed milliseconds.
     #>
     param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][object[]]$Candidates)
 
@@ -857,7 +930,7 @@ function Invoke-CandidateMeasurement {
                 continue
             }
             if (@($healthy | Where-Object { $_.Score -ge $targets.Count }).Count -ge [int]$test.wantHealthy) { break }
-            $score = 0; $totalMs = 0
+            $roundScores = @(); $totalMs = 0
             for ($round = 1; $round -le [int]$test.rounds; $round++) {
                 $watch = [System.Diagnostics.Stopwatch]::StartNew()
                 $roundScore = 0
@@ -865,10 +938,11 @@ function Invoke-CandidateMeasurement {
                     if (Test-HealthTarget -Target $target -LocalPort $instance.Port -TimeoutSec ([int]$test.probeTimeoutSec)) { $roundScore++ }
                 }
                 $watch.Stop(); $totalMs += $watch.ElapsedMilliseconds
-                if ($roundScore -gt $score) { $score = $roundScore }
+                $roundScores += $roundScore
             }
+            $score = Get-CandidateStableScore -RoundScores $roundScores
             if ($score -gt 0) {
-                Write-Log -Message ('  candidate usable: {0} {1}:{2} probe {3}/{4}, two rounds {5}ms' -f $instance.Candidate.Label, $instance.Candidate.Host, $instance.Candidate.Port, $score, $targets.Count, $totalMs) -Path $Config.log
+                Write-Log -Message ('  candidate usable: {0} {1}:{2} probe {3}/{4} over {5} rounds, {6}ms total' -f $instance.Candidate.Label, $instance.Candidate.Host, $instance.Candidate.Port, $score, $targets.Count, $test.rounds, $totalMs) -Path $Config.log
                 $healthy += [pscustomobject]@{ Endpoint = $instance.Candidate; Ms = $totalMs; Score = $score }
             } else {
                 Write-Log -Message ('  candidate unusable: {0} {1}:{2}' -f $instance.Candidate.Label, $instance.Candidate.Host, $instance.Candidate.Port) -Path $Config.log
@@ -1023,7 +1097,10 @@ function Restore-ConfigBytes {
         return $false
     }
     try {
-        [System.IO.File]::WriteAllBytes([string]$Config.service.configPath, [byte[]]$Bytes)
+        if (-not (Replace-FileBytesAtomically -Path ([string]$Config.service.configPath) -Bytes ([byte[]]$Bytes))) {
+            Write-Log -Message 'could not atomically restore the previous configuration' -Path $Config.log
+            return $false
+        }
         Write-Log -Message 'previous configuration restored' -Path $Config.log
         return $true
     } catch {

@@ -54,7 +54,8 @@ target and asserts on the response body - not on the connection succeeding.
 2. Fetch the endpoint catalog and rank candidates (region preference, minus the active one).
 3. Start one **isolated instance** of the service per candidate, each on its own port,
    and measure every candidate twice. The live service keeps serving traffic throughout.
-4. Rank by probe score, then by the **sum of both rounds** (single samples are noise).
+4. Rank by the lowest per-round availability score, then by the **total elapsed time across
+   all rounds**. One good sample cannot hide an unstable candidate.
 5. Keep only candidates that are **strictly better** than the current score, unless
    `-ForceSwitch` was requested. No improvement means no change.
 6. Patch the live configuration, restart the service, verify, and fall through to the

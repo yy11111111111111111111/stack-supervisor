@@ -77,9 +77,9 @@ understand the service's full configuration schema.
 Measurement stops early once `wantHealthy` candidates have reached a full score, which
 keeps a recovery round to a few seconds in the common case.
 
-Ranking is `(score desc, total milliseconds asc)`, where total is the sum of two rounds.
-This is not cosmetic: ranking on a single sample once promoted the endpoint with the
-worst true latency in the candidate set.
+Each candidate's score is the lowest number of answering targets across all measurement
+rounds. Ranking is `(score desc, total milliseconds asc)`, where total is the sum of round
+durations. A good single round cannot hide a failed or degraded round.
 
 ## Configuration patching
 
@@ -99,7 +99,9 @@ object graph:
    will write needs its path to exist.
 4. Parse the patched file again, find the same object through the same JSON pointer, read
    host and port back from it, and compare them with the endpoint that was requested.
-5. Back up the previous file, then write.
+5. Back up the exact byte snapshot that was parsed. Write the replacement to a temporary file
+   in the same directory, compare the current file with that snapshot, then atomically replace
+   it. A concurrent writer can still race between the final comparison and the replace.
 
 Step 2 is the important one. A configuration often mentions the endpoint tag in more than
 one place - for example a forwarder object that contains a nested reference to the

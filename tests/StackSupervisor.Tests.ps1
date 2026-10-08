@@ -115,6 +115,26 @@ Describe 'JSON source-span selection and patching' {
         @(Get-ChildItem -LiteralPath $backupDir -Filter 'config-*.json').Count | Should -Be 1
     }
 
+    It 'refuses to overwrite a concurrent edit made before the atomic replacement' {
+        $path = Join-Path $TestDrive 'concurrent.json'
+        $json = '{"outbounds":[{"tag":"primary","kind":"proxy","target":{"host":"old.example","port":443}}]}'
+        $script:concurrentExternal = '{"admin":"changed while failover was being measured"}'
+        [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
+        $config = New-TestConfig
+        $config.service.configPath = $path
+        $endpoint = [pscustomobject]@{ Host = 'new.example'; Port = 8443; Fields = @{ host = 'new.example'; port = 8443 } }
+        Mock Write-TextFileAtomically {
+            [System.IO.File]::WriteAllText($Path, $script:concurrentExternal, (New-Object System.Text.UTF8Encoding($false)))
+            return $false
+        }
+        Mock Write-Log {}
+
+        Set-ActiveEndpoint -Config $config -Endpoint $endpoint | Should -BeFalse
+
+        [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) | Should -BeExactly $script:concurrentExternal
+        Should -Invoke Write-Log -ParameterFilter { $Message -like '*changed after it was read*refusing to overwrite*' }
+    }
+
     It 'leaves the live file untouched when a legacy patch is ambiguous' {
         $path = Join-Path $TestDrive 'ambiguous.json'
         $backupDir = Join-Path $TestDrive 'ambiguous-backups'
@@ -159,6 +179,51 @@ Describe 'JSON source-span selection and patching' {
         [System.IO.File]::ReadAllText($path) | Should -BeExactly $json
         Test-Path -LiteralPath $backupDir | Should -BeFalse
         Should -Invoke Write-Log -ParameterFilter { $Message -like 'read-back validation failed*' }
+    }
+}
+
+Describe 'Atomic configuration writes' {
+    It 'replaces the file and verifies the original bytes before committing' {
+        $path = Join-Path $TestDrive 'gateway.json'
+        $oldText = '{"state":"old"}'
+        $newText = '{"state":"new"}'
+        $original = (New-Object System.Text.UTF8Encoding($false)).GetBytes($oldText)
+        [System.IO.File]::WriteAllBytes($path, $original)
+
+        Write-TextFileAtomically -Path $path -Text $newText -ExpectedBytes $original | Should -BeTrue
+
+        [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) | Should -BeExactly $newText
+        @((Get-ChildItem -LiteralPath $TestDrive -Force | Where-Object { $_.Name -like '*.tmp*' })).Count | Should -Be 0
+    }
+
+    It 'preserves a configuration changed by another writer after it was read' {
+        $path = Join-Path $TestDrive 'gateway.json'
+        $oldText = '{"state":"old"}'
+        $externalText = '{"state":"admin-edit"}'
+        $original = (New-Object System.Text.UTF8Encoding($false)).GetBytes($oldText)
+        [System.IO.File]::WriteAllBytes($path, $original)
+        [System.IO.File]::WriteAllText($path, $externalText, (New-Object System.Text.UTF8Encoding($false)))
+
+        Write-TextFileAtomically -Path $path -Text '{"state":"supervisor-edit"}' -ExpectedBytes $original | Should -BeFalse
+
+        [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) | Should -BeExactly $externalText
+        @((Get-ChildItem -LiteralPath $TestDrive -Force | Where-Object { $_.Name -like '*.tmp' })).Count | Should -Be 0
+    }
+
+    It 'leaves the existing file intact when Windows refuses the replacement' -Skip:([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        $path = Join-Path $TestDrive 'gateway.json'
+        $oldText = '{"state":"old"}'
+        $original = (New-Object System.Text.UTF8Encoding($false)).GetBytes($oldText)
+        [System.IO.File]::WriteAllBytes($path, $original)
+        $lock = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try {
+            { Write-TextFileAtomically -Path $path -Text '{"state":"new"}' -ExpectedBytes $original } | Should -Throw
+        } finally {
+            $lock.Dispose()
+        }
+
+        [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) | Should -BeExactly $oldText
+        @((Get-ChildItem -LiteralPath $TestDrive -Force | Where-Object { $_.Name -like '*.tmp*' })).Count | Should -Be 0
     }
 }
 
@@ -230,6 +295,36 @@ Describe 'Health scoring and failover decisions' {
 
         Invoke-Failover -Config $config -Reason 'test' -CurrentScore 2 | Should -BeFalse
         Should -Invoke Set-ActiveEndpoint -Times 0 -Exactly
+    }
+
+    It 'uses the lowest score across candidate measurement rounds' {
+        Get-CandidateStableScore -RoundScores @(2, 1) | Should -Be 1
+        Get-CandidateStableScore -RoundScores @(2, 0) | Should -Be 0
+        Get-CandidateStableScore -RoundScores @(2, 2) | Should -Be 2
+    }
+}
+
+Describe 'Catalog URI prefix compatibility' {
+    It 'accepts the <Prefix> form for base64 URI catalogs' -TestCases @(
+        @{ Prefix = 'edge' },
+        @{ Prefix = 'edge://' }
+    ) {
+        param($Prefix)
+        $catalogPath = Join-Path $TestDrive 'catalog.txt'
+        $uri = 'edge://token@example.net:443?region=hk#HongKong'
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($uri))
+        [System.IO.File]::WriteAllText($catalogPath, $encoded, (New-Object System.Text.UTF8Encoding($false)))
+        $config = New-TestConfig
+        $config.service.catalog = [pscustomobject]@{
+            file = $catalogPath; format = 'base64-uri'; uriPrefix = $Prefix; maxCandidates = 8
+        }
+
+        $endpoints = @(Get-CatalogEndpoints -Config $config)
+
+        $endpoints.Count | Should -Be 1
+        $endpoints[0].Host | Should -Be 'example.net'
+        $endpoints[0].Port | Should -Be 443
+        $endpoints[0].Fields.region | Should -Be 'hk'
     }
 }
 
