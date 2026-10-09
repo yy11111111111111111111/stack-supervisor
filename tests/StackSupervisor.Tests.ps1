@@ -1012,3 +1012,67 @@ Describe 'Service start command parsing' {
         Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $ArgumentList -eq ('serve --config "' + $config.service.configPath + '"') }
     }
 }
+
+Describe 'Probe instance template resolution' {
+    It 'resolves a relative template file against the configuration directory' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ('stack-supervisor-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        try {
+            $configPath = Join-Path $dir 'gateway.json'
+            [System.IO.File]::WriteAllText($configPath, '{"outbounds":[{"tag":"primary","kind":"proxy","target":{"host":"a.example","port":1}}]}')
+            [System.IO.File]::WriteAllText((Join-Path $dir 'probe.template.json'), '{"listeners":[{"port":{port}}],"upstreams":[{outbound}]}')
+
+            $config = New-TestConfig
+            $config.service.configPath = $configPath
+            $config.service | Add-Member -NotePropertyName candidateTest -NotePropertyValue ([pscustomobject]@{
+                instanceTemplateFile = 'probe.template.json'
+                basePort             = 19101
+                probeExecutable      = 'gateway'
+                probeArguments       = '{config}'
+                rounds               = 1
+                wantHealthy          = 1
+                probeTimeoutSec      = 1
+            }) -Force
+            $candidate = [pscustomobject]@{ Label = 'hk1'; Host = 'cdn.example.org'; Port = 443; Fields = @{ host = 'cdn.example.org'; port = 443 } }
+
+            # The template lives next to the configuration, not next to whatever called this function.
+            Mock Start-Process { [pscustomobject]@{ HasExited = $true; Id = 0 } }
+
+            { Invoke-CandidateMeasurement -Config $config -Candidates @($candidate) } | Should -Not -Throw
+        }
+        finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'accepts instanceTemplateFile with strict mode enabled' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ('stack-supervisor-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        try {
+            $configPath = Join-Path $dir 'gateway.json'
+            [System.IO.File]::WriteAllText($configPath, '{"outbounds":[{"tag":"primary","kind":"proxy","target":{"host":"a.example","port":1}}]}')
+            [System.IO.File]::WriteAllText((Join-Path $dir 'probe.template.json'), '{"listeners":[{"port":{port}}],"upstreams":[{outbound}]}')
+
+            $config = New-TestConfig
+            $config.service.configPath = $configPath
+            $config.service | Add-Member -NotePropertyName candidateTest -NotePropertyValue ([pscustomobject]@{
+                instanceTemplateFile = 'probe.template.json'
+                basePort             = 19103
+                probeExecutable      = 'gateway'
+                probeArguments       = '{config}'
+                rounds               = 1
+                wantHealthy          = 1
+                probeTimeoutSec      = 1
+            }) -Force
+            $candidate = [pscustomobject]@{ Label = 'hk1'; Host = 'cdn.example.org'; Port = 443; Fields = @{ host = 'cdn.example.org'; port = 443 } }
+
+            Mock Start-Process { [pscustomobject]@{ HasExited = $true; Id = 0 } }
+
+            Set-StrictMode -Version Latest
+            { Invoke-CandidateMeasurement -Config $config -Candidates @($candidate) } | Should -Not -Throw
+        }
+        finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}

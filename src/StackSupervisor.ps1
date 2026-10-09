@@ -885,11 +885,13 @@ function Invoke-CandidateMeasurement {
 
     $test = $Config.service.candidateTest
     $selector = Get-Selector -Config $Config
-    $template = [string]$test.instanceTemplate
+    # Both spellings are optional, so neither may be read under StrictMode without checking.
+    $template = ''
+    if ($test.PSObject.Properties.Name.Contains('instanceTemplate')) { $template = [string]$test.instanceTemplate }
     if (-not $template -and $test.PSObject.Properties.Name.Contains('instanceTemplateFile') -and $test.instanceTemplateFile) {
         $templatePath = [string]$test.instanceTemplateFile
         if (-not [System.IO.Path]::IsPathRooted($templatePath)) {
-            $templatePath = Join-Path ([System.IO.Path]::GetDirectoryName($ConfigPath)) $templatePath
+            $templatePath = Join-Path ([System.IO.Path]::GetDirectoryName($Config.service.configPath)) $templatePath
         }
         if (Test-Path -LiteralPath $templatePath) { $template = Read-TextFile -Path $templatePath }
     }
