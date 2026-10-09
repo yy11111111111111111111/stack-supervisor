@@ -54,16 +54,23 @@ target and asserts on the response body - not on the connection succeeding.
 2. Fetch the endpoint catalog and rank candidates (region preference, minus the active one).
 3. Start one **isolated instance** of the service per candidate, each on its own port,
    and measure every candidate twice. The live service keeps serving traffic throughout.
-4. Rank by probe score, then by the **sum of both rounds** (single samples are noise).
+4. Rank by the lowest per-round availability score, then by the **total elapsed time across
+   all rounds**. One good sample cannot hide an unstable candidate.
 5. Keep only candidates that are **strictly better** than the current score, unless
    `-ForceSwitch` was requested. No improvement means no change.
 6. Patch the live configuration, restart the service, verify, and fall through to the
-   next candidate if verification fails.
+   next candidate if verification fails. If the restart itself does not complete, the
+   previous configuration is put back and the attempt ends: nothing is scored against a
+   process that never restarted.
 
 ## Safety rules
 
 - Every write is preceded by a timestamped backup (last 10 kept).
 - The patched file is re-parsed and the changed fields are read back before it is written.
+- A configuration that cannot be read unambiguously is never guessed at: a syntax error, zero
+  or several matching endpoint objects, or a patch path that does not exist refuse the write,
+  and the reason (with line and column for a syntax error) goes to `supervisor.log`.
+- A failover attempt that raises an unexpected error costs one round, not the supervisor.
 - A cooldown window prevents flapping between candidates.
 - `-DryRun` measures everything and writes nothing.
 - A missing service is only started by the supervisor when the dedicated process keeper
@@ -104,6 +111,25 @@ Windows 10/11 with Windows PowerShell 5.1 or PowerShell 7. No external modules.
 Everything runs as the signed-in user; the only privileged action is an optional
 scheduled-task registration for all users.
 
+### What the supervised service has to satisfy
+
+The supervisor refuses to act, and says why in `supervisor.log`, when these do not hold:
+
+- **The live configuration is strict JSON.** No comments, no trailing commas, and no
+  duplicate property name anywhere in the file (not only inside the endpoint object).
+  An edit that preserves formatting needs to know exactly where every value is; a file the
+  parser cannot read exactly would be patched on a guess.
+- **Exactly one object carries the configured `tag` and every `requireProperties` entry.**
+- **Every `path` in `patchRules` exists in that object** and points at a string, number or
+  boolean. A rule that uses `{attr:name}` is skipped when the candidate has no such
+  attribute, and then its path does not have to exist.
+- **The service is started with the absolute path of `configPath` on its command line**
+  (the `{config}` placeholder in `startCommand` does that). The supervisor identifies the
+  service by executable name *and* that path, stops only the one process that matches, and
+  does nothing destructive when none or several match, or when it cannot read the command
+  lines (the process may belong to another user or be more privileged than the supervisor).
+  Look for `deferring recovery:` in the log; the text after the colon says which case applies.
+
 ## Operations
 
 ```powershell
@@ -118,10 +144,9 @@ the second instance exit immediately instead of fighting over the configuration 
 
 ## Status and limitations
 
-This is a working tool, not a finished one. `docs/LIMITATIONS.md` lists - bluntly - the
-parts the author is least confident about, including several High severity concerns in the
-configuration patching and service restart paths. `tests/` describes the test suite the
-project needs but does not have yet, and `CONTRIBUTING.md` explains how to help.
+This is a working tool, not a finished one. `docs/LIMITATIONS.md` tracks open risks and
+recently resolved items. `tests/` contains the Pester v5 regression suite; run it with
+`.\tests\Invoke-Tests.ps1`. `CONTRIBUTING.md` explains how to help.
 
 If you are reviewing this project: start with the limitations list, then the incidents in
 `docs/LESSONS.md`. Both are written to be attacked.

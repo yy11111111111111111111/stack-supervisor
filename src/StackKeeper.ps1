@@ -38,6 +38,13 @@ function Write-KeeperLog {
     if (-not $Quiet) { Write-Host $line }
 }
 
+function Test-KeeperCommandLineMatch {
+    param([object[]]$Processes, [Parameter(Mandatory)][int]$SelfProcessId, [Parameter(Mandatory)][string]$Pattern)
+    return [bool](@($Processes | Where-Object {
+        $_.ProcessId -ne $SelfProcessId -and $_.CommandLine -match $Pattern
+    }).Count -gt 0)
+}
+
 $config = ([System.IO.File]::ReadAllText($ConfigPath, [System.Text.Encoding]::UTF8)) | ConvertFrom-Json
 $logPath = [string]$config.keepAlive.log
 $recovered = @()
@@ -52,8 +59,8 @@ foreach ($component in $config.keepAlive.components) {
             # Excluding the current process matters: a detection command that embeds the
             # pattern it searches for will otherwise match itself and report a false positive.
             $self = $PID
-            $present = [bool](Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-                Where-Object { $_.ProcessId -ne $self -and $_.CommandLine -match ([string]$component.detect.pattern) })
+            $processes = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'")
+            $present = Test-KeeperCommandLineMatch -Processes $processes -SelfProcessId $self -Pattern ([string]$component.detect.pattern)
         }
     }
     if (-not $present) {

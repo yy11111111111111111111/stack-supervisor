@@ -84,6 +84,47 @@ function Write-TextFile {
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Replace-FileBytesAtomically {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [byte[]]$ExpectedBytes
+    )
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $directory = [System.IO.Path]::GetDirectoryName($fullPath)
+    $name = [System.IO.Path]::GetFileName($fullPath)
+    $temporary = Join-Path $directory ('.' + $name + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $temporaryBackup = $temporary + '.previous'
+    try {
+        [System.IO.File]::WriteAllBytes($temporary, $Bytes)
+        if ($null -ne $ExpectedBytes) {
+            $currentBytes = [System.IO.File]::ReadAllBytes($fullPath)
+            $same = $currentBytes.Length -eq $ExpectedBytes.Length
+            if ($same) {
+                for ($i = 0; $i -lt $currentBytes.Length; $i++) {
+                    if ($currentBytes[$i] -ne $ExpectedBytes[$i]) { $same = $false; break }
+                }
+            }
+            if (-not $same) { return $false }
+        }
+        [System.IO.File]::Replace($temporary, $fullPath, $temporaryBackup)
+        return $true
+    } finally {
+        foreach ($temporaryPath in @($temporary, $temporaryBackup)) {
+            if (Test-Path -LiteralPath $temporaryPath) {
+                Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+function Write-TextFileAtomically {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Text, [byte[]]$ExpectedBytes)
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    $bytes = $encoding.GetBytes($Text)
+    return Replace-FileBytesAtomically -Path $Path -Bytes $bytes -ExpectedBytes $ExpectedBytes
+}
+
 #endregion
 
 #region ------------------------------------------------------------------- json
@@ -109,65 +150,292 @@ function Get-JsonPathValue {
     return $current
 }
 
-function Get-JsonObjectBlock {
-    <#
-        Extracts the raw text of the JSON object that carries a given tag, together with its
-        offsets, so a single object can be patched without reformatting the whole file.
+function Skip-JsonWhitespace {
+    param([Parameter(Mandatory)]$State)
+    while ($State.Index -lt $State.Text.Length -and [int]$State.Text[$State.Index] -in @(9, 10, 13, 32)) {
+        $State.Index++
+    }
+}
 
-        Only objects that declare the tag *and* every property listed in -RequireProperty are
-        accepted. Without that guard a nested reference to the same tag - for example a route
-        that points at the endpoint by name - matches first and the wrong object is rewritten.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Text,
-        [Parameter(Mandatory)][string]$Tag,
-        [string[]]$RequireProperty = @()
-    )
-    $needle = '"tag"' + ': "' + $Tag + '"'
-    $from = 0
-    while ($true) {
-        $idx = $Text.IndexOf($needle, $from, [System.StringComparison]::Ordinal)
-        if ($idx -lt 0) { return $null }
-        $from = $idx + 1
-        $start = $Text.LastIndexOf('{', $idx)
-        if ($start -lt 0) { continue }
-        $depth = 0; $inString = $false; $escaped = $false
-        for ($i = $start; $i -lt $Text.Length; $i++) {
-            $ch = $Text[$i]
-            if ($inString) {
-                if ($escaped) { $escaped = $false }
-                elseif ($ch -eq [char]92) { $escaped = $true }
-                elseif ($ch -eq '"') { $inString = $false }
-            } else {
-                if ($ch -eq '"') { $inString = $true }
-                elseif ($ch -eq '{') { $depth++ }
-                elseif ($ch -eq '}') {
-                    $depth--
-                    if ($depth -eq 0) {
-                        $candidate = $Text.Substring($start, $i - $start + 1)
-                        $accepted = $false
-                        try {
-                            $parsed = $candidate | ConvertFrom-Json
-                            if ($parsed.tag -eq $Tag) {
-                                $accepted = $true
-                                foreach ($property in $RequireProperty) {
-                                    if (-not $parsed.PSObject.Properties.Name.Contains($property)) { $accepted = $false }
-                                }
-                            }
-                        } catch { }
-                        if ($accepted) { return [pscustomobject]@{ Start = $start; End = $i; Text = $candidate } }
-                        break
-                    }
-                }
+function Read-JsonStringToken {
+    param([Parameter(Mandatory)]$State)
+    if ($State.Index -ge $State.Text.Length -or $State.Text[$State.Index] -ne '"') {
+        throw 'expected a JSON string'
+    }
+    $start = $State.Index
+    $State.Index++
+    $closed = $false
+    $hasEscape = $false
+    while ($State.Index -lt $State.Text.Length) {
+        $ch = $State.Text[$State.Index]
+        if ($ch -eq '"') {
+            $State.Index++
+            $closed = $true
+            break
+        }
+        if ([int]$ch -lt 32) { throw 'unescaped control character in JSON string' }
+        if ($ch -eq [char]92) {
+            $hasEscape = $true
+            $State.Index++
+            if ($State.Index -ge $State.Text.Length) { throw 'incomplete JSON escape' }
+            $escaped = $State.Text[$State.Index]
+            if ($escaped -eq 'u') {
+                if ($State.Index + 4 -ge $State.Text.Length) { throw 'incomplete JSON unicode escape' }
+                $hex = $State.Text.Substring($State.Index + 1, 4)
+                if ($hex -notmatch '^[0-9a-fA-F]{4}$') { throw 'invalid JSON unicode escape' }
+                $State.Index += 5
+                continue
+            }
+            $validEscapes = '"' + [char]92 + '/bfnrt'
+            if ($validEscapes.IndexOf([string]$escaped, [System.StringComparison]::Ordinal) -lt 0) {
+                throw 'invalid JSON escape'
             }
         }
+        $State.Index++
+    }
+    if (-not $closed) { throw 'unterminated JSON string' }
+    if ($hasEscape) {
+        $raw = $State.Text.Substring($start, $State.Index - $start)
+        $value = [string](ConvertFrom-Json -InputObject $raw -ErrorAction Stop)
+    } else {
+        # ConvertFrom-Json would turn text such as 2024-01-02T03:04:05Z into a [datetime] on PowerShell 7.
+        $value = $State.Text.Substring($start + 1, $State.Index - $start - 2)
+    }
+    return [pscustomobject]@{ Start = $start; End = $State.Index; Value = $value }
+}
+
+function ConvertTo-JsonPointerSegment {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Segment)
+    return $Segment.Replace('~', '~0').Replace('/', '~1')
+}
+
+function Read-JsonValueToken {
+    param([Parameter(Mandatory)]$State, [string]$Path = '')
+    Skip-JsonWhitespace -State $State
+    if ($State.Index -ge $State.Text.Length) { throw 'unexpected end of JSON document' }
+    $start = $State.Index
+    $ch = $State.Text[$State.Index]
+
+    if ($ch -eq '{') {
+        $State.Index++
+        Skip-JsonWhitespace -State $State
+        $members = New-Object System.Collections.ArrayList
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        if ($State.Index -lt $State.Text.Length -and $State.Text[$State.Index] -eq '}') {
+            $State.Index++
+            return [pscustomobject]@{ Kind = 'Object'; Start = $start; End = $State.Index; Path = $Path; Value = $null; Members = @(); Items = @() }
+        }
+        while ($true) {
+            Skip-JsonWhitespace -State $State
+            $key = Read-JsonStringToken -State $State
+            if (-not $seen.Add($key.Value)) { throw ('duplicate JSON property: ' + $key.Value) }
+            Skip-JsonWhitespace -State $State
+            if ($State.Index -ge $State.Text.Length -or $State.Text[$State.Index] -ne ':') { throw 'expected colon after JSON property name' }
+            $State.Index++
+            $childPath = $Path + '/' + (ConvertTo-JsonPointerSegment -Segment $key.Value)
+            $child = Read-JsonValueToken -State $State -Path $childPath
+            $members.Add([pscustomobject]@{ Name = $key.Value; KeyStart = $key.Start; Node = $child }) | Out-Null
+            Skip-JsonWhitespace -State $State
+            if ($State.Index -ge $State.Text.Length) { throw 'unterminated JSON object' }
+            if ($State.Text[$State.Index] -eq '}') { $State.Index++; break }
+            if ($State.Text[$State.Index] -ne ',') { throw 'expected comma or closing brace in JSON object' }
+            $State.Index++
+        }
+        return [pscustomobject]@{ Kind = 'Object'; Start = $start; End = $State.Index; Path = $Path; Value = $null; Members = @($members.ToArray()); Items = @() }
+    }
+
+    if ($ch -eq '[') {
+        $State.Index++
+        Skip-JsonWhitespace -State $State
+        $items = New-Object System.Collections.ArrayList
+        if ($State.Index -lt $State.Text.Length -and $State.Text[$State.Index] -eq ']') {
+            $State.Index++
+            return [pscustomobject]@{ Kind = 'Array'; Start = $start; End = $State.Index; Path = $Path; Value = $null; Members = @(); Items = @() }
+        }
+        $index = 0
+        while ($true) {
+            $childPath = $Path + '/' + [string]$index
+            $child = Read-JsonValueToken -State $State -Path $childPath
+            $items.Add($child) | Out-Null
+            $index++
+            Skip-JsonWhitespace -State $State
+            if ($State.Index -ge $State.Text.Length) { throw 'unterminated JSON array' }
+            if ($State.Text[$State.Index] -eq ']') { $State.Index++; break }
+            if ($State.Text[$State.Index] -ne ',') { throw 'expected comma or closing bracket in JSON array' }
+            $State.Index++
+        }
+        return [pscustomobject]@{ Kind = 'Array'; Start = $start; End = $State.Index; Path = $Path; Value = $null; Members = @(); Items = @($items.ToArray()) }
+    }
+
+    if ($ch -eq '"') {
+        $string = Read-JsonStringToken -State $State
+        return [pscustomobject]@{ Kind = 'String'; Start = $string.Start; End = $string.End; Path = $Path; Value = $string.Value; Members = @(); Items = @() }
+    }
+
+    if ($ch -eq 't' -and $State.Index + 4 -le $State.Text.Length -and $State.Text.Substring($State.Index, 4) -ceq 'true') {
+        $State.Index += 4
+        return [pscustomobject]@{ Kind = 'Boolean'; Start = $start; End = $State.Index; Path = $Path; Value = $true; Members = @(); Items = @() }
+    }
+    if ($ch -eq 'f' -and $State.Index + 5 -le $State.Text.Length -and $State.Text.Substring($State.Index, 5) -ceq 'false') {
+        $State.Index += 5
+        return [pscustomobject]@{ Kind = 'Boolean'; Start = $start; End = $State.Index; Path = $Path; Value = $false; Members = @(); Items = @() }
+    }
+    if ($ch -eq 'n' -and $State.Index + 4 -le $State.Text.Length -and $State.Text.Substring($State.Index, 4) -ceq 'null') {
+        $State.Index += 4
+        return [pscustomobject]@{ Kind = 'Null'; Start = $start; End = $State.Index; Path = $Path; Value = $null; Members = @(); Items = @() }
+    }
+    $tokenEnd = $State.Index
+    while ($tokenEnd -lt $State.Text.Length) {
+        $tokenChar = $State.Text[$tokenEnd]
+        $tokenCode = [int]$tokenChar
+        if ($tokenCode -eq 9 -or $tokenCode -eq 10 -or $tokenCode -eq 13 -or $tokenCode -eq 32 -or
+            $tokenChar -eq ',' -or $tokenChar -eq ']' -or $tokenChar -eq '}') { break }
+        $tokenEnd++
+    }
+    $numberText = $State.Text.Substring($State.Index, $tokenEnd - $State.Index)
+    $number = [regex]::Match($numberText, '^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?')
+    if ($number.Success) {
+        $State.Index += $number.Length
+        return [pscustomobject]@{ Kind = 'Number'; Start = $start; End = $State.Index; Path = $Path; Value = $number.Value; Members = @(); Items = @() }
+    }
+    throw 'invalid JSON value'
+}
+
+function Get-JsonErrorLocation {
+    <# Turns a character offset into 'line L, column C' for messages. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [int]$Offset)
+    if ($Offset -lt 0) { $Offset = 0 }
+    if ($Offset -gt $Text.Length) { $Offset = $Text.Length }
+    $lines = $Text.Substring(0, $Offset).Split([char]10)
+    return ('line {0}, column {1}' -f $lines.Length, ($lines[$lines.Length - 1].Length + 1))
+}
+
+function Get-JsonDocumentTree {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $state = @{ Text = $Text; Index = 0 }
+    try {
+        $root = Read-JsonValueToken -State $state
+        Skip-JsonWhitespace -State $state
+        if ($state.Index -ne $Text.Length) { throw 'unexpected content after the JSON value' }
+    } catch {
+        $detail = $_.Exception.Message
+        throw ('JSON syntax error at {0}: {1}' -f (Get-JsonErrorLocation -Text $Text -Offset $state.Index), $detail)
+    }
+    return $root
+}
+
+function Get-JsonMemberNode {
+    param([Parameter(Mandatory)]$Node, [Parameter(Mandatory)][string]$Name)
+    if ($Node.Kind -ne 'Object') { return $null }
+    foreach ($member in $Node.Members) {
+        if ([string]::Equals([string]$member.Name, $Name, [System.StringComparison]::Ordinal)) { return $member.Node }
     }
     return $null
 }
 
-function Set-RegexFirst {
-    param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][string]$Pattern, [Parameter(Mandatory)][string]$Replacement)
-    return ([regex]::new($Pattern)).Replace($Text, $Replacement, 1)
+function Get-JsonPathNode {
+    param([Parameter(Mandatory)]$Node, [Parameter(Mandatory)][string]$Path)
+    $current = $Node
+    foreach ($segment in $Path.Split('.')) {
+        $match = [regex]::Match($segment, '^([^\[\]]+)(?:\[(\d+)\])?$')
+        if (-not $match.Success) { return $null }
+        $current = Get-JsonMemberNode -Node $current -Name $match.Groups[1].Value
+        if (-not $current) { return $null }
+        if ($match.Groups[2].Success) {
+            if ($current.Kind -ne 'Array') { return $null }
+            $index = [int]$match.Groups[2].Value
+            if ($index -ge $current.Items.Count) { return $null }
+            $current = $current.Items[$index]
+        }
+    }
+    return $current
+}
+
+function Get-JsonNodeByPointer {
+    param([Parameter(Mandatory)]$Root, [Parameter(Mandatory)][AllowEmptyString()][string]$Pointer)
+    if (-not $Pointer) { return $Root }
+    if (-not $Pointer.StartsWith('/')) { return $null }
+    $current = $Root
+    foreach ($rawSegment in $Pointer.Substring(1).Split('/')) {
+        $segment = $rawSegment.Replace('~1', '/').Replace('~0', '~')
+        if ($current.Kind -eq 'Object') {
+            $current = Get-JsonMemberNode -Node $current -Name $segment
+        } elseif ($current.Kind -eq 'Array' -and $segment -match '^\d+$') {
+            $index = [int]$segment
+            if ($index -ge $current.Items.Count) { return $null }
+            $current = $current.Items[$index]
+        } else { return $null }
+        if (-not $current) { return $null }
+    }
+    return $current
+}
+
+function Get-JsonObjectNodes {
+    param([Parameter(Mandatory)]$Node)
+    if ($Node.Kind -eq 'Object') {
+        Write-Output -NoEnumerate $Node
+        foreach ($member in $Node.Members) { Get-JsonObjectNodes -Node $member.Node }
+    } elseif ($Node.Kind -eq 'Array') {
+        foreach ($item in $Node.Items) { Get-JsonObjectNodes -Node $item }
+    }
+}
+
+function Get-JsonObjectBlock {
+    <#
+        Finds exactly one JSON object with a direct tag property and all required siblings, or returns $null.
+        -Reason receives the explanation for a $null result (syntax error with its position, no match, or the
+        paths of an ambiguous match) so that callers can log why.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][string]$Tag,
+        [string[]]$RequireProperty = @(),
+        [ref]$Reason
+    )
+    try { $root = Get-JsonDocumentTree -Text $Text }
+    catch {
+        if ($Reason) { $Reason.Value = $_.Exception.Message }
+        return $null
+    }
+    $found = New-Object System.Collections.ArrayList
+    foreach ($candidate in @(Get-JsonObjectNodes -Node $root)) {
+        $tagNode = Get-JsonMemberNode -Node $candidate -Name 'tag'
+        if (-not $tagNode -or $tagNode.Kind -ne 'String' -or $tagNode.Value -cne $Tag) { continue }
+        $accepted = $true
+        foreach ($property in $RequireProperty) {
+            if (-not (Get-JsonMemberNode -Node $candidate -Name ([string]$property))) { $accepted = $false; break }
+        }
+        if ($accepted) { $found.Add($candidate) | Out-Null }
+    }
+    if ($found.Count -ne 1) {
+        if ($Reason) {
+            $needs = ''
+            if (@($RequireProperty).Count -gt 0) { $needs = ' with the properties ' + (@($RequireProperty) -join ', ') }
+            if ($found.Count -eq 0) {
+                $Reason.Value = "no JSON object has tag '$Tag'$needs"
+            } else {
+                $paths = @($found | ForEach-Object { $_.Path }) -join ', '
+                $Reason.Value = "$($found.Count) JSON objects have tag '$Tag'$needs (paths $paths); refusing to choose one"
+            }
+        }
+        return $null
+    }
+    $object = $found[0]
+    return [pscustomobject]@{
+        Start = $object.Start
+        End = $object.End
+        Path = $object.Path
+        Text = $Text.Substring($object.Start, $object.End - $object.Start)
+    }
+}
+
+function Set-JsonStringPathValue {
+    param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Value)
+    $tree = Get-JsonDocumentTree -Text $Text
+    $node = Get-JsonPathNode -Node $tree -Path $Path
+    if (-not $node -or $node.Kind -ne 'String') { throw ('JSON path is not a string value: ' + $Path) }
+    $rawValue = [string](ConvertTo-Json -InputObject $Value -Compress -Depth 100)
+    return $Text.Substring(0, $node.Start) + $rawValue + $Text.Substring($node.End)
 }
 
 function Expand-Template {
@@ -214,6 +482,37 @@ function Get-Selector {
 
 #region ------------------------------------------------------------------- probe
 
+function Read-HttpHeaderBlock {
+    <# Reads through CRLF CRLF without buffering or consuming bytes from the next protocol layer. #>
+    param([Parameter(Mandatory)][System.IO.Stream]$Stream, [int]$MaxBytes = 65536)
+    $header = New-Object System.IO.MemoryStream
+    $one = New-Object byte[] 1
+    $matched = 0
+    try {
+        while ($header.Length -lt $MaxBytes) {
+            $read = $Stream.Read($one, 0, 1)
+            if ($read -le 0) { throw 'connection closed before HTTP headers completed' }
+            $byte = $one[0]
+            $header.WriteByte($byte)
+            switch ($matched) {
+                0 { if ($byte -eq 13) { $matched = 1 } }
+                1 {
+                    if ($byte -eq 10) { $matched = 2 }
+                    elseif ($byte -eq 13) { $matched = 1 }
+                    else { $matched = 0 }
+                }
+                2 { if ($byte -eq 13) { $matched = 3 } else { $matched = 0 } }
+                3 {
+                    if ($byte -eq 10) { return [System.Text.Encoding]::ASCII.GetString($header.ToArray()) }
+                    elseif ($byte -eq 13) { $matched = 1 }
+                    else { $matched = 0 }
+                }
+            }
+        }
+        throw ('HTTP headers exceeded the {0}-byte limit' -f $MaxBytes)
+    } finally { $header.Dispose() }
+}
+
 function Invoke-GatewayProbe {
     <#
         Sends one request through the local service endpoint and returns the raw response.
@@ -228,6 +527,7 @@ function Invoke-GatewayProbe {
     )
     $uri = [System.Uri]$Url
     $client = New-Object System.Net.Sockets.TcpClient
+    $ssl = $null
     try {
         $iar = $client.BeginConnect('127.0.0.1', $LocalPort, $null, $null)
         if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutSec * 1000)) { throw 'connect timeout' }
@@ -241,10 +541,9 @@ function Invoke-GatewayProbe {
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($connect)
         $stream.Write($bytes, 0, $bytes.Length); $stream.Flush()
 
-        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::ASCII, $false, 1024, $true)
-        $status = $reader.ReadLine()
-        if (-not $status -or $status -notmatch ' 200') { throw "endpoint refused CONNECT: $status" }
-        while ($true) { $line = $reader.ReadLine(); if ([string]::IsNullOrEmpty($line)) { break } }
+        $connectResponse = Read-HttpHeaderBlock -Stream $stream
+        $status = ($connectResponse -split "`r`n", 2)[0]
+        if (-not $status -or $status -notmatch '^HTTP/\d(?:\.\d)?\s+200(?:\s|$)') { throw "endpoint refused CONNECT: $status" }
 
         $active = $stream
         if (-not $NoTls) {
@@ -268,7 +567,10 @@ function Invoke-GatewayProbe {
             $memory.Write($buffer, 0, $read)
         }
         return [System.Text.Encoding]::UTF8.GetString($memory.ToArray())
-    } finally { $client.Close() }
+    } finally {
+        if ($ssl) { $ssl.Dispose() }
+        $client.Close()
+    }
 }
 
 function Get-HealthTargets {
@@ -314,29 +616,88 @@ function Get-GatewayScore {
 function Get-ActiveEndpoint {
     param([Parameter(Mandatory)]$Config)
     $selector = Get-Selector -Config $Config
-    if (-not (Test-Path -LiteralPath $Config.service.configPath)) { return $null }
+    if (-not (Test-Path -LiteralPath $Config.service.configPath)) {
+        Write-Log -Message ('configuration file not found: ' + $Config.service.configPath) -Path $Config.log
+        return $null
+    }
     $text = Read-TextFile -Path $Config.service.configPath
-    $block = Get-JsonObjectBlock -Text $text -Tag $selector.Tag -RequireProperty $selector.Required
-    if (-not $block) { return $null }
+    $why = ''
+    $block = Get-JsonObjectBlock -Text $text -Tag $selector.Tag -RequireProperty $selector.Required -Reason ([ref]$why)
+    if (-not $block) {
+        Write-Log -Message ('active endpoint not found: ' + $why) -Path $Config.log
+        return $null
+    }
     $object = $block.Text | ConvertFrom-Json
     $fields = @{}
     foreach ($property in $selector.Read.PSObject.Properties) {
         $fields[$property.Name] = Get-JsonPathValue -Object $object -Path ([string]$property.Value)
     }
-    if (-not $fields.ContainsKey('host') -or -not $fields.ContainsKey('port')) { return $null }
+    if (-not $fields.ContainsKey('host') -or -not $fields.ContainsKey('port') -or $null -eq $fields['host'] -or $null -eq $fields['port']) {
+        Write-Log -Message ('readFields host/port did not resolve in the endpoint object at ' + $block.Path) -Path $Config.log
+        return $null
+    }
     return [pscustomobject]@{ Host = [string]$fields['host']; Port = [int]$fields['port']; Fields = $fields }
 }
 
 function Update-EndpointBlock {
-    <# Applies the configured patch rules to one endpoint block and returns the new text. #>
+    <# Applies path-based source-span patches, then compatible unique legacy regex patches. #>
     param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$BlockText, [Parameter(Mandatory)]$Endpoint)
     $selector = Get-Selector -Config $Config
     $tokens = @{ host = $Endpoint.Host; port = $Endpoint.Port }
     foreach ($key in $Endpoint.Fields.Keys) {
-        if ($key -ne 'host' -and $key -ne 'port' -and $Endpoint.Fields[$key]) { $tokens['attr:' + $key] = [string]$Endpoint.Fields[$key] }
+        if ($key -ne 'host' -and $key -ne 'port' -and $null -ne $Endpoint.Fields[$key]) {
+            $tokens['attr:' + $key] = [string]$Endpoint.Fields[$key]
+        }
     }
     $patched = $BlockText
+    $tree = Get-JsonDocumentTree -Text $BlockText
+    $edits = New-Object System.Collections.ArrayList
+    $legacyRules = New-Object System.Collections.ArrayList
+    $usedPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
     foreach ($rule in $selector.Patch) {
+        $pathProperty = $rule.PSObject.Properties['path']
+        $valueProperty = $rule.PSObject.Properties['value']
+        if ($pathProperty -and $valueProperty) {
+            $path = [string]$pathProperty.Value
+            if (-not $usedPaths.Add($path)) { throw ('duplicate patch path: ' + $path) }
+            $template = [string]$valueProperty.Value
+            $skip = $false
+            foreach ($match in [regex]::Matches($template, '\{attr:([^\}]+)\}')) {
+                if (-not $tokens.ContainsKey('attr:' + $match.Groups[1].Value)) { $skip = $true; break }
+            }
+            # An optional attribute the candidate does not carry switches the rule off, exactly as it does for
+            # legacy rules. Only a rule that is going to write needs its path to exist.
+            if ($skip) { continue }
+            $node = Get-JsonPathNode -Node $tree -Path $path
+            if (-not $node) { throw ('patch path does not exist: ' + $path) }
+            if ($node.Kind -notin @('String', 'Number', 'Boolean')) { throw ('patch path is not a scalar value: ' + $path) }
+            $value = Expand-Template -Template $template -Tokens $tokens
+            if ($node.Kind -eq 'String') {
+                $rawValue = [string](ConvertTo-Json -InputObject ([string]$value) -Compress -Depth 100)
+            } elseif ($node.Kind -eq 'Number') {
+                if ($value -notmatch '^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$') {
+                    throw ('patch value is not a JSON number for path: ' + $path)
+                }
+                $rawValue = [string]$value
+            } else {
+                $rawValue = ([string]$value).ToLowerInvariant()
+                if ($rawValue -notin @('true', 'false')) { throw ('patch value is not a JSON boolean for path: ' + $path) }
+            }
+            $edits.Add([pscustomobject]@{ Start = $node.Start; End = $node.End; Text = $rawValue }) | Out-Null
+            continue
+        }
+
+        # Existing configurations may still use pattern/replacement. Keep them safe by
+        # refusing zero or multiple matches instead of silently patching the first one.
+        if (-not $rule.PSObject.Properties['pattern'] -or -not $rule.PSObject.Properties['replacement']) {
+            throw 'patch rule must define either path/value or pattern/replacement'
+        }
+        $legacyRules.Add($rule) | Out-Null
+    }
+    foreach ($edit in @($edits | Sort-Object -Property Start -Descending)) {
+        $patched = $patched.Substring(0, $edit.Start) + $edit.Text + $patched.Substring($edit.End)
+    }
+    foreach ($rule in $legacyRules) {
         $replacement = [string]$rule.replacement
         $skip = $false
         foreach ($match in [regex]::Matches($replacement, '\{attr:([^\}]+)\}')) {
@@ -344,7 +705,12 @@ function Update-EndpointBlock {
             if (-not $tokens.ContainsKey('attr:' + $name)) { $skip = $true; break }
         }
         if ($skip) { continue }
-        $patched = Set-RegexFirst -Text $patched -Pattern ([string]$rule.pattern) -Replacement (Expand-Template -Template $replacement -Tokens $tokens)
+        $pattern = [string]$rule.pattern
+        $matches = [regex]::Matches($patched, $pattern)
+        if ($matches.Count -ne 1) { throw ('legacy patch pattern must match exactly once: ' + $pattern) }
+        $match = $matches[0]
+        $replacement = Expand-Template -Template $replacement -Tokens $tokens
+        $patched = $patched.Substring(0, $match.Index) + $replacement + $patched.Substring($match.Index + $match.Length)
     }
     return $patched
 }
@@ -354,30 +720,29 @@ function Set-ActiveEndpoint {
     param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)]$Endpoint)
     $path = $Config.service.configPath
     $selector = Get-Selector -Config $Config
+    $originalBytes = [System.IO.File]::ReadAllBytes([string]$path)
     $text = Read-TextFile -Path $path
-    $block = Get-JsonObjectBlock -Text $text -Tag $selector.Tag -RequireProperty $selector.Required
-    if (-not $block) { Write-Log -Message 'endpoint block not found; refusing to write' -Path $Config.log; return $false }
-
-    $updated = $text.Substring(0, $block.Start) + (Update-EndpointBlock -Config $Config -BlockText $block.Text -Endpoint $Endpoint) + $text.Substring($block.End + 1)
+    $why = ''
+    $block = Get-JsonObjectBlock -Text $text -Tag $selector.Tag -RequireProperty $selector.Required -Reason ([ref]$why)
+    if (-not $block) { Write-Log -Message ('endpoint block not found; refusing to write: ' + $why) -Path $Config.log; return $false }
 
     try {
-        $parsed = $updated | ConvertFrom-Json
-        $object = $null
-        foreach ($candidate in $parsed.PSObject.Properties) {
-            if ($candidate.Value -isnot [System.Array]) { continue }
-            foreach ($item in $candidate.Value) {
-                if ($item.PSObject.Properties.Name.Contains('tag') -and $item.tag -eq $selector.Tag) { $object = $item }
-            }
-        }
-        if (-not $object) { Write-Log -Message 'read-back could not locate the endpoint block' -Path $Config.log; return $false }
-        $host = Get-JsonPathValue -Object $object -Path ([string]$selector.Read.host)
-        $port = Get-JsonPathValue -Object $object -Path ([string]$selector.Read.port)
-        if ([string]$host -ne [string]$Endpoint.Host -or [int]$port -ne [int]$Endpoint.Port) {
+        $updated = $text.Substring(0, $block.Start) + (Update-EndpointBlock -Config $Config -BlockText $block.Text -Endpoint $Endpoint) + $text.Substring($block.End)
+        $parsed = ConvertFrom-Json -InputObject $updated -ErrorAction Stop
+        $tree = Get-JsonDocumentTree -Text $updated
+        $object = Get-JsonNodeByPointer -Root $tree -Pointer $block.Path
+        if (-not $object -or $object.Kind -ne 'Object') { Write-Log -Message 'read-back could not locate the patched endpoint path' -Path $Config.log; return $false }
+        $hostNode = Get-JsonPathNode -Node $object -Path ([string]$selector.Read.host)
+        $portNode = Get-JsonPathNode -Node $object -Path ([string]$selector.Read.port)
+        if (-not $hostNode -or -not $portNode) { Write-Log -Message 'read-back could not resolve endpoint fields at the selected path' -Path $Config.log; return $false }
+        $readBackHost = $hostNode.Value
+        $port = $portNode.Value
+        if ([string]$readBackHost -ne [string]$Endpoint.Host -or [int]$port -ne [int]$Endpoint.Port) {
             Write-Log -Message 'read-back validation failed; refusing to write' -Path $Config.log
             return $false
         }
     } catch {
-        Write-Log -Message ('updated configuration does not parse: ' + $_.Exception.Message) -Path $Config.log
+        Write-Log -Message ('patch or read-back validation failed; refusing to write: ' + $_.Exception.Message) -Path $Config.log
         return $false
     }
 
@@ -385,11 +750,19 @@ function Set-ActiveEndpoint {
     if ($backupDir) {
         if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
         $stamp = Get-Date -Format 'yyyyMMddHHmmss'
-        Copy-Item -LiteralPath $path -Destination (Join-Path $backupDir ('config-' + $stamp + '.json')) -Force
+        [System.IO.File]::WriteAllBytes((Join-Path $backupDir ('config-' + $stamp + '.json')), $originalBytes)
         Get-ChildItem -LiteralPath $backupDir -Filter 'config-*.json' | Sort-Object LastWriteTime -Descending |
             Select-Object -Skip 10 | Remove-Item -Force -ErrorAction SilentlyContinue
     }
-    Write-TextFile -Path $path -Text $updated
+    try { $written = Write-TextFileAtomically -Path $path -Text $updated -ExpectedBytes $originalBytes }
+    catch {
+        Write-Log -Message ('could not atomically replace the configuration: ' + $_.Exception.Message) -Path $Config.log
+        return $false
+    }
+    if (-not $written) {
+        Write-Log -Message 'configuration changed after it was read; refusing to overwrite it' -Path $Config.log
+        return $false
+    }
     return $true
 }
 
@@ -416,15 +789,20 @@ function Get-CatalogEndpoints {
         $raw = $response.Content
     }
     $raw = $raw.Trim()
-    $scheme = [string]$feed.uriPrefix
-    if ($feed.format -eq 'base64-uri' -and $raw -notmatch [regex]::Escape($scheme)) {
+    $scheme = ([string]$feed.uriPrefix).Trim()
+    if ($scheme.EndsWith('://', [System.StringComparison]::Ordinal)) {
+        $scheme = $scheme.Substring(0, $scheme.Length - 3)
+    }
+    if (-not $scheme) { Write-Log -Message 'catalog uriPrefix must name a URI scheme' -Path $Config.log; return @() }
+    $schemePattern = [regex]::Escape($scheme) + '://'
+    if ($feed.format -eq 'base64-uri' -and $raw -notmatch $schemePattern) {
         $raw = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($raw))
     }
 
     $endpoints = @()
-    $pattern = '^' + [regex]::Escape($scheme) + '://[^@]+@([^:]+):(\d+)\?(.+)$'
+    $pattern = '^' + $schemePattern + '[^@]+@([^:]+):(\d+)\?(.+)$'
     foreach ($line in ($raw -split '\s+')) {
-        if (-not $line.StartsWith($scheme)) { continue }
+        if (-not $line.StartsWith($scheme + '://', [System.StringComparison]::Ordinal)) { continue }
         if ($line -notmatch $pattern) { continue }
         $hostName = $Matches[1]; $port = [int]$Matches[2]; $rest = $Matches[3]
         $label = ''
@@ -458,6 +836,16 @@ function Get-EndpointRank {
 
 #region -------------------------------------------------- isolated candidate test
 
+function Get-CandidateStableScore {
+    param([int[]]$RoundScores = @())
+    if (-not $RoundScores -or $RoundScores.Count -eq 0) { return 0 }
+    $score = [int]::MaxValue
+    foreach ($roundScore in $RoundScores) {
+        if ($roundScore -lt $score) { $score = $roundScore }
+    }
+    return $score
+}
+
 function Invoke-CandidateMeasurement {
     <#
         Measures candidates without touching the live service.
@@ -469,8 +857,8 @@ function Invoke-CandidateMeasurement {
         configuration is not touched until a winner has been chosen, probing candidates can
         never take production traffic down.
 
-        Ranking uses the sum of both rounds. A single sample is dominated by noise: one such
-        sample once promoted the endpoint with the worst true latency in the candidate set.
+        The availability score is the lowest score across rounds, so a single good sample
+        cannot hide an unstable candidate. Ties are ranked by total elapsed milliseconds.
     #>
     param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][object[]]$Candidates)
 
@@ -487,8 +875,9 @@ function Invoke-CandidateMeasurement {
     if (-not $template) { Write-Log -Message 'candidateTest.instanceTemplate or instanceTemplateFile is required' -Path $Config.log; return @() }
 
     $liveText = Read-TextFile -Path $Config.service.configPath
-    $liveBlock = Get-JsonObjectBlock -Text $liveText -Tag $selector.Tag -RequireProperty $selector.Required
-    if (-not $liveBlock) { Write-Log -Message 'cannot build probe instances: endpoint block not found' -Path $Config.log; return @() }
+    $why = ''
+    $liveBlock = Get-JsonObjectBlock -Text $liveText -Tag $selector.Tag -RequireProperty $selector.Required -Reason ([ref]$why)
+    if (-not $liveBlock) { Write-Log -Message ('cannot build probe instances: endpoint block not found: ' + $why) -Path $Config.log; return @() }
 
     $workDir = [System.IO.Path]::GetDirectoryName($Config.service.configPath)
     $targets = Get-HealthTargets -Config $Config
@@ -497,10 +886,13 @@ function Invoke-CandidateMeasurement {
     try {
         for ($i = 0; $i -lt $Candidates.Count; $i++) {
             $port = [int]$test.basePort + $i
-            $tagPattern = '"tag"\s*:\s*"' + [regex]::Escape($selector.Tag) + '"'
-            $tagValue = '"tag": "probe-out-' + $i + '"'
-            $blockText = Set-RegexFirst -Text $liveBlock.Text -Pattern $tagPattern -Replacement $tagValue
-            $blockText = Update-EndpointBlock -Config $Config -BlockText $blockText -Endpoint $Candidates[$i]
+            try {
+                $blockText = Set-JsonStringPathValue -Text $liveBlock.Text -Path 'tag' -Value ('probe-out-' + $i)
+                $blockText = Update-EndpointBlock -Config $Config -BlockText $blockText -Endpoint $Candidates[$i]
+            } catch {
+                Write-Log -Message ('  cannot build a probe instance for {0} {1}:{2}: {3}' -f $Candidates[$i].Label, $Candidates[$i].Host, $Candidates[$i].Port, $_.Exception.Message) -Path $Config.log
+                continue
+            }
             $document = Expand-Template -Template $template -Tokens @{ index = $i; port = $port; outbound = $blockText }
             $configFile = Join-Path $workDir ('_probe-' + $PID + '-' + $i + '.json')
             Write-TextFile -Path $configFile -Text $document
@@ -538,7 +930,7 @@ function Invoke-CandidateMeasurement {
                 continue
             }
             if (@($healthy | Where-Object { $_.Score -ge $targets.Count }).Count -ge [int]$test.wantHealthy) { break }
-            $score = 0; $totalMs = 0
+            $roundScores = @(); $totalMs = 0
             for ($round = 1; $round -le [int]$test.rounds; $round++) {
                 $watch = [System.Diagnostics.Stopwatch]::StartNew()
                 $roundScore = 0
@@ -546,10 +938,11 @@ function Invoke-CandidateMeasurement {
                     if (Test-HealthTarget -Target $target -LocalPort $instance.Port -TimeoutSec ([int]$test.probeTimeoutSec)) { $roundScore++ }
                 }
                 $watch.Stop(); $totalMs += $watch.ElapsedMilliseconds
-                if ($roundScore -gt $score) { $score = $roundScore }
+                $roundScores += $roundScore
             }
+            $score = Get-CandidateStableScore -RoundScores $roundScores
             if ($score -gt 0) {
-                Write-Log -Message ('  candidate usable: {0} {1}:{2} probe {3}/{4}, two rounds {5}ms' -f $instance.Candidate.Label, $instance.Candidate.Host, $instance.Candidate.Port, $score, $targets.Count, $totalMs) -Path $Config.log
+                Write-Log -Message ('  candidate usable: {0} {1}:{2} probe {3}/{4} over {5} rounds, {6}ms total' -f $instance.Candidate.Label, $instance.Candidate.Host, $instance.Candidate.Port, $score, $targets.Count, $test.rounds, $totalMs) -Path $Config.log
                 $healthy += [pscustomobject]@{ Endpoint = $instance.Candidate; Ms = $totalMs; Score = $score }
             } else {
                 Write-Log -Message ('  candidate unusable: {0} {1}:{2}' -f $instance.Candidate.Label, $instance.Candidate.Host, $instance.Candidate.Port) -Path $Config.log
@@ -579,19 +972,100 @@ function Start-ServiceProcess {
     }
 }
 
+function Get-ServiceProcessSnapshot {
+    <#
+        Separates same-name processes from the unique instance identified by its config path. Reason says in
+        words why the answer is what it is: the supervisor runs hidden, and 'ambiguous' alone does not tell an
+        operator what to fix.
+    #>
+    param([Parameter(Mandatory)]$Config)
+    $name = [System.IO.Path]::GetFileName([string]$Config.service.processName)
+    if ([System.IO.Path]::GetExtension($name) -eq '') { $name += '.exe' }
+    $filter = "Name='" + $name.Replace("'", "''") + "'"
+    $processes = @(Get-CimInstance -ClassName Win32_Process -Filter $filter -ErrorAction Stop)
+    # Both sides use backslashes, so the comparison does not depend on how either path was written.
+    $configPath = [System.IO.Path]::GetFullPath([string]$Config.service.configPath).Replace('/', '\')
+    $matching = @($processes | Where-Object {
+        $_.CommandLine -and ([string]$_.CommandLine).Replace('/', '\').IndexOf($configPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    })
+    if ($processes.Count -eq 0) {
+        $reason = "no process named $name is running"
+    } elseif ($matching.Count -eq 1) {
+        $reason = "exactly one $name process carries $configPath in its command line"
+    } elseif ($matching.Count -gt 1) {
+        $reason = "$($matching.Count) $name processes carry $configPath in their command lines"
+    } else {
+        $reason = "$($processes.Count) $name process(es) are running but none carries $configPath in its command line; start the service with the absolute configPath"
+        $unreadable = @($processes | Where-Object { -not $_.CommandLine }).Count
+        if ($unreadable -gt 0) { $reason += " ($unreadable command line(s) could not be read; the supervisor may lack the rights to see them)" }
+    }
+    return [pscustomobject]@{ Processes = $processes; Matching = $matching; Reason = $reason }
+}
+
+function Get-ServiceProcessCandidates {
+    param([Parameter(Mandatory)]$Config)
+    $snapshot = Get-ServiceProcessSnapshot -Config $Config
+    return @($snapshot.Matching)
+}
+
 function Restart-ServiceProcess {
     param([Parameter(Mandatory)]$Config, [int]$WaitSec = 40)
-    $name = [string]$Config.service.processName
-    Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    try { $targets = @(Get-ServiceProcessCandidates -Config $Config) }
+    catch {
+        Write-Log -Message ('cannot inspect service processes; refusing to restart: ' + $_.Exception.Message) -Path $Config.log
+        return $false
+    }
+    if ($targets.Count -ne 1) {
+        Write-Log -Message ('cannot safely identify one configured service process (found {0}); refusing to stop processes by name' -f $targets.Count) -Path $Config.log
+        return $false
+    }
+    $targetId = [int]$targets[0].ProcessId
+    Stop-Process -Id $targetId -Force -ErrorAction SilentlyContinue
     $deadline = (Get-Date).AddSeconds($WaitSec)
     while ((Get-Date) -lt $deadline) {
+        try { $running = @(Get-ServiceProcessCandidates -Config $Config) }
+        catch {
+            Write-Log -Message ('cannot inspect service processes during restart: ' + $_.Exception.Message) -Path $Config.log
+            return $false
+        }
+        if ($running.Count -gt 1) {
+            Write-Log -Message 'multiple configured service processes appeared during restart; refusing to choose one' -Path $Config.log
+            return $false
+        }
+        if ($running.Count -eq 1 -and [int]$running[0].ProcessId -ne $targetId) { return $true }
         Start-Sleep -Seconds 2
-        if (Get-Process -Name $name -ErrorAction SilentlyContinue) { return $true }
+    }
+    try { $remaining = @(Get-ServiceProcessCandidates -Config $Config) }
+    catch {
+        Write-Log -Message ('cannot verify service stop; refusing to start another instance: ' + $_.Exception.Message) -Path $Config.log
+        return $false
+    }
+    if ($remaining.Count -gt 1) {
+        Write-Log -Message 'multiple configured service processes appeared during restart; refusing to start another instance' -Path $Config.log
+        return $false
+    }
+    if ($remaining.Count -eq 1 -and [int]$remaining[0].ProcessId -ne $targetId) { return $true }
+    if ($remaining.Count -eq 1) {
+        Write-Log -Message 'configured service process did not stop in time; refusing to start another instance' -Path $Config.log
+        return $false
     }
     Write-Log -Message 'external keeper did not restart the service in time; starting it here' -Path $Config.log
     Start-ServiceProcess -Config $Config
-    Start-Sleep -Seconds 4
-    return [bool](Get-Process -Name $name -ErrorAction SilentlyContinue)
+    $startDeadline = (Get-Date).AddSeconds([Math]::Max(4, $WaitSec))
+    while ((Get-Date) -lt $startDeadline) {
+        try { $running = @(Get-ServiceProcessCandidates -Config $Config) }
+        catch {
+            Write-Log -Message ('cannot verify service start: ' + $_.Exception.Message) -Path $Config.log
+            return $false
+        }
+        if ($running.Count -eq 1) { return $true }
+        if ($running.Count -gt 1) {
+            Write-Log -Message 'multiple configured service processes appeared after restart' -Path $Config.log
+            return $false
+        }
+        Start-Sleep -Seconds 1
+    }
+    return $false
 }
 
 function Test-UpstreamReachability {
@@ -615,8 +1089,28 @@ function Test-UpstreamReachability {
     return $false
 }
 
+function Restore-ConfigBytes {
+    <# Puts back the exact bytes that were read before the first write of a failover attempt. #>
+    param([Parameter(Mandatory)]$Config, $Bytes)
+    if ($null -eq $Bytes) {
+        Write-Log -Message 'no copy of the previous configuration is available to restore' -Path $Config.log
+        return $false
+    }
+    try {
+        if (-not (Replace-FileBytesAtomically -Path ([string]$Config.service.configPath) -Bytes ([byte[]]$Bytes))) {
+            Write-Log -Message 'could not atomically restore the previous configuration' -Path $Config.log
+            return $false
+        }
+        Write-Log -Message 'previous configuration restored' -Path $Config.log
+        return $true
+    } catch {
+        Write-Log -Message ('could not restore the previous configuration: ' + $_.Exception.Message) -Path $Config.log
+        return $false
+    }
+}
+
 function Invoke-Failover {
-    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$Reason, [int]$CurrentScore = 0, [switch]$Force)
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$Reason, [int]$CurrentScore = 0, [switch]$Force, [switch]$DryRun)
     $active = Get-ActiveEndpoint -Config $Config
     if (-not $active) { Write-Log -Message 'cannot read the active endpoint; aborting failover' -Path $Config.log; return $false }
     Write-Log -Message ('failover started ({0}); active endpoint {1}:{2}' -f $Reason, $active.Host, $active.Port) -Path $Config.log
@@ -648,12 +1142,22 @@ function Invoke-Failover {
         $healthy = $better
     }
 
+    $originalBytes = $null
     foreach ($entry in $healthy) {
         $endpoint = $entry.Endpoint
         Write-Log -Message ('trying {0} {1}:{2} (probe score {3})' -f $endpoint.Label, $endpoint.Host, $endpoint.Port, $entry.Score) -Path $Config.log
         if ($DryRun) { Write-Log -Message 'dry run: configuration left untouched' -Path $Config.log; return $true }
+        if ($null -eq $originalBytes) {
+            try { $originalBytes = [System.IO.File]::ReadAllBytes([string]$Config.service.configPath) } catch { $originalBytes = $null }
+        }
         if (-not (Set-ActiveEndpoint -Config $Config -Endpoint $endpoint)) { continue }
-        Restart-ServiceProcess -Config $Config | Out-Null
+        if (-not (Restart-ServiceProcess -Config $Config)) {
+            # The file has changed but the service did not follow. Scoring now would measure the old process and could
+            # report a switch that never took effect, so put the file back and let a later round decide again.
+            Write-Log -Message 'the service did not restart; restoring the previous configuration so the file matches the running process' -Path $Config.log
+            Restore-ConfigBytes -Config $Config -Bytes $originalBytes | Out-Null
+            return $false
+        }
         $score = Get-GatewayScore -Config $Config
         if ($score -ge 1) {
             Write-Log -Message ('switch complete: {0} {1}:{2} is serving (score {3})' -f $endpoint.Label, $endpoint.Host, $endpoint.Port, $score) -Path $Config.log
@@ -663,6 +1167,21 @@ function Invoke-Failover {
     }
     Write-Log -Message 'every candidate failed verification; keeping the last written configuration' -Path $Config.log
     return $false
+}
+
+function Invoke-FailoverGuarded {
+    <#
+        The supervisor runs hidden, so an uncaught exception ends the process without a trace in the
+        log. A failover that throws is treated like one that found nothing: log it, report failure,
+        and let the next round decide again.
+    #>
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$Reason, [int]$CurrentScore = 0, [switch]$Force, [switch]$DryRun)
+    try {
+        return [bool](Invoke-Failover -Config $Config -Reason $Reason -CurrentScore $CurrentScore -Force:$Force -DryRun:$DryRun)
+    } catch {
+        Write-Log -Message ('failover aborted by an unexpected error: {0} (line {1})' -f $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber) -Path $Config.log
+        return $false
+    }
 }
 
 #endregion
@@ -693,18 +1212,41 @@ Write-Log -Message ('supervisor started (interval {0}s, fail threshold {1}, degr
 
 $failures = 0; $degraded = 0; $missing = 0
 $lastSwitch = [datetime]::MinValue
-$serviceName = [string]$config.service.processName
 
 while ($true) {
-    if (-not (Get-Process -Name $serviceName -ErrorAction SilentlyContinue)) {
+    try { $serviceState = Get-ServiceProcessSnapshot -Config $config }
+    catch {
+        Write-Log -Message ('cannot inspect service processes; deferring recovery: ' + $_.Exception.Message) -Path $logPath
+        $missing = 0; $failures = 0; $degraded = 0
+        if ($Once) { break }
+        Start-Sleep -Seconds $CheckIntervalSec
+        continue
+    }
+    if ($serviceState.Matching.Count -gt 1 -or ($serviceState.Processes.Count -gt 0 -and $serviceState.Matching.Count -eq 0)) {
+        Write-Log -Message ('service executable is present but its configured instance is ambiguous; deferring recovery: ' + $serviceState.Reason) -Path $logPath
+        $missing = 0; $failures = 0; $degraded = 0
+        if ($Once) { break }
+        Start-Sleep -Seconds $CheckIntervalSec
+        continue
+    }
+    if ($serviceState.Matching.Count -eq 0) {
         $missing++
         if ($missing -eq 1) { Write-Log -Message 'service process is not running; deferring to the process keeper' -Path $logPath }
         if ($missing -ge $MissingThreshold) {
             Write-Log -Message ('service missing for {0} rounds and the process keeper has not acted; starting it here' -f $missing) -Path $logPath
-            Start-ServiceProcess -Config $config
+            try { Start-ServiceProcess -Config $config }
+            catch { Write-Log -Message ('could not start the service: ' + $_.Exception.Message) -Path $logPath }
             Start-Sleep -Seconds 5
-            if (Get-Process -Name $serviceName -ErrorAction SilentlyContinue) {
+            try { $startedState = Get-ServiceProcessSnapshot -Config $config }
+            catch {
+                Write-Log -Message ('cannot verify service start; will not launch another instance yet: ' + $_.Exception.Message) -Path $logPath
+                $startedState = $null
+            }
+            if ($startedState -and $startedState.Matching.Count -eq 1) {
                 Write-Log -Message 'service started by the supervisor' -Path $logPath
+                $missing = 0
+            } elseif ($startedState -and ($startedState.Matching.Count -gt 1 -or $startedState.Processes.Count -gt 0)) {
+                Write-Log -Message ('service start is ambiguous; deferring further recovery: ' + $startedState.Reason) -Path $logPath
                 $missing = 0
             }
         }
@@ -717,7 +1259,7 @@ while ($true) {
             if ($failures -gt 0 -or $degraded -gt 0) { Write-Log -Message 'health restored' -Path $logPath }
             $failures = 0; $degraded = 0
             if ($ForceSwitch) {
-                Invoke-Failover -Config $config -Reason 'forced re-selection' -CurrentScore $score -Force | Out-Null
+                Invoke-FailoverGuarded -Config $config -Reason 'forced re-selection' -CurrentScore $score -Force -DryRun:$DryRun | Out-Null
                 break
             }
         }
@@ -732,7 +1274,7 @@ while ($true) {
             if ($shouldSwitch) {
                 $reason = 'degraded for ' + $degraded + ' rounds'
                 if ($ForceSwitch) { $reason = 'forced re-selection' }
-                if (Invoke-Failover -Config $config -Reason $reason -CurrentScore $score -Force:$ForceSwitch) { $lastSwitch = Get-Date }
+                if (Invoke-FailoverGuarded -Config $config -Reason $reason -CurrentScore $score -Force:$ForceSwitch -DryRun:$DryRun) { $lastSwitch = Get-Date }
                 $degraded = 0
                 if ($ForceSwitch) { break }
             }
@@ -746,7 +1288,7 @@ while ($true) {
                 } else {
                     $reason = 'failed ' + $failures + ' consecutive rounds'
                     if ($ForceSwitch) { $reason = 'forced re-selection' }
-                    if (Invoke-Failover -Config $config -Reason $reason -CurrentScore $score -Force:$ForceSwitch) { $lastSwitch = Get-Date }
+                    if (Invoke-FailoverGuarded -Config $config -Reason $reason -CurrentScore $score -Force:$ForceSwitch -DryRun:$DryRun) { $lastSwitch = Get-Date }
                     $failures = 0
                     if ($ForceSwitch) { break }
                 }

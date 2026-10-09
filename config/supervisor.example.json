@@ -9,6 +9,7 @@
     "endpointSelector": {
       "//": "Which object in configPath describes the active upstream, how to read it, and how to rewrite it.",
       "//2": "requireProperties keeps the lookup unambiguous when the same tag also appears in a nested reference.",
+      "//3": "Prefer path/value patch rules; legacy pattern/replacement rules are accepted only when each pattern matches once.",
       "tag": "primary-upstream",
       "requireProperties": [
         "kind"
@@ -21,20 +22,20 @@
       },
       "patchRules": [
         {
-          "pattern": "\"host\"\\s*:\\s*\"[^\"]*\"",
-          "replacement": "\"host\": \"{host}\""
+          "path": "target.host",
+          "value": "{host}"
         },
         {
-          "pattern": "\"port\"\\s*:\\s*\\d+",
-          "replacement": "\"port\": {port}"
+          "path": "target.port",
+          "value": "{port}"
         },
         {
-          "pattern": "\"id\"\\s*:\\s*\"[^\"]*\"",
-          "replacement": "\"id\": \"{attr:token}\""
+          "path": "target.id",
+          "value": "{attr:token}"
         },
         {
-          "pattern": "\"serverName\"\\s*:\\s*\"[^\"]*\"",
-          "replacement": "\"serverName\": \"{attr:sni}\""
+          "path": "tls.serverName",
+          "value": "{attr:sni}"
         }
       ]
     },
@@ -61,7 +62,8 @@
       "//2": "Every query parameter of an endpoint URI becomes an attribute usable as {attr:name} in patchRules.",
       "url": "https://catalog.example.net/endpoints",
       "format": "base64-uri",
-      "uriPrefix": "edge://",
+      "//3": "uriPrefix accepts the URI scheme with or without ://, for example edge or edge://.",
+      "uriPrefix": "edge",
       "maxCandidates": 8,
       "regionRank": {
         "hk": 0,
