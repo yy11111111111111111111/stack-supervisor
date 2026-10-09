@@ -957,3 +957,58 @@ Describe 'Service process identity: the reason is spelled out' {
         $snapshot.Reason | Should -BeLike '*1 command line(s) could not be read*'
     }
 }
+
+Describe 'Probe certificate policy' {
+    It 'uses the platform validation by default' {
+        Get-ProbeCertificateCallback | Should -BeNullOrEmpty
+    }
+
+    It 'accepts an untrusted certificate only when explicitly allowed' {
+        $callback = Get-ProbeCertificateCallback -AllowUntrusted
+        $callback | Should -Not -BeNullOrEmpty
+        $callback.Invoke($null, $null, $null, [System.Net.Security.SslPolicyErrors]::RemoteCertificateChainErrors) | Should -BeTrue
+    }
+}
+
+Describe 'Service start command parsing' {
+    It 'keeps a quoted executable whose path contains spaces intact' {
+        $info = ConvertTo-ProcessStartInfo -Command '"C:\Program Files\Edge Gateway\edge-gateway.exe" serve --config "C:\ProgramData\edge gateway\gateway.json"'
+
+        $info.FilePath | Should -Be 'C:\Program Files\Edge Gateway\edge-gateway.exe'
+        $info.Arguments | Should -Be 'serve --config "C:\ProgramData\edge gateway\gateway.json"'
+    }
+
+    It 'accepts an unquoted executable without whitespace' {
+        $info = ConvertTo-ProcessStartInfo -Command 'C:\edge\edge-gateway.exe serve'
+
+        $info.FilePath | Should -Be 'C:\edge\edge-gateway.exe'
+        $info.Arguments | Should -Be 'serve'
+    }
+
+    It 'reports no arguments when the command is only an executable' {
+        (ConvertTo-ProcessStartInfo -Command '"C:\edge\edge-gateway.exe"').Arguments | Should -Be ''
+    }
+
+    It 'refuses a start command that does not begin with an absolute path' {
+        { ConvertTo-ProcessStartInfo -Command 'edge-gateway.exe serve' } | Should -Throw
+    }
+
+    It 'starts the executable even when its path contains spaces' {
+        $config = New-TestConfig
+        $config.service.startCommand = '"C:\Program Files\Edge Gateway\edge-gateway.exe" serve --config "{config}"'
+        Mock Start-Process { }
+
+        Start-ServiceProcess -Config $config | Should -Be 'C:\Program Files\Edge Gateway\edge-gateway.exe'
+        Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'C:\Program Files\Edge Gateway\edge-gateway.exe' }
+    }
+
+    It 'prefers startExecutable and startArguments when they are configured' {
+        $config = New-TestConfig
+        $config.service | Add-Member -NotePropertyName startExecutable -NotePropertyValue 'C:\edge\edge-gateway.exe'
+        $config.service | Add-Member -NotePropertyName startArguments -NotePropertyValue 'serve --config "{config}"'
+        Mock Start-Process { }
+
+        Start-ServiceProcess -Config $config | Should -Be 'C:\edge\edge-gateway.exe'
+        Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $ArgumentList -eq ('serve --config "' + $config.service.configPath + '"') }
+    }
+}

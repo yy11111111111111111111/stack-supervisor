@@ -1,4 +1,4 @@
-# Known limitations and open questions
+﻿# Known limitations and open questions
 
 This supervisor runs in production on one host, but parts of it are best described as
 *the first version that survived the incidents in LESSONS.md*, not as finished work.
@@ -6,19 +6,23 @@ The list below is deliberately blunt. It includes current risks and recently add
 items with their status, so contributors can see both where review effort pays off and
 which issue references have been closed by code.
 
+`docs/REVIEW-INDEPENDENT.md` records an independent review of the same paths. It lists twenty
+findings with reproduction notes; rows 1 to 7 below are its Critical/High items, and the
+remaining ones are tracked with an explicit status.
+
 ## Risk areas and status
 
 | # | Area | Concern | Severity | Status |
 |---|---|---|---|---|
 | 1 | `Invoke-GatewayProbe` | A buffering reader could consume bytes after the CONNECT header terminator. | High | Resolved: exact-length header reader |
-| 2 | `Invoke-GatewayProbe` | `RemoteCertificateValidationCallback { $true }` disables certificate validation even though the response body drives a recovery decision. | Medium | Open |
+| 2 | `Invoke-GatewayProbe` | `RemoteCertificateValidationCallback { $true }` disables certificate validation even though the response body drives a recovery decision. | Medium | Resolved: platform validation by default, `-AllowUntrustedCertificate` is an explicit opt-in |
 | 3 | `Get-JsonObjectBlock` | Brace scanning could misidentify the object to rewrite. | High | Resolved: strict JSON tree with source spans |
 | 4 | `Set-ActiveEndpoint` read-back | Heuristic object search could validate the wrong endpoint. | Medium | Resolved: read back through the selected JSON pointer |
 | 5 | Patch rules | Replacing the first regex match could rewrite a nested field. | High | Resolved for path rules; legacy rules require one match |
-| 6 | `Start-ServiceProcess` | Regex command splitting can break paths with spaces or complex arguments. | Medium | Open |
+| 6 | `Start-ServiceProcess` | Regex command splitting can break paths with spaces or complex arguments. | Medium | Resolved: a quoted executable is taken verbatim, `startExecutable`/`startArguments` can be configured explicitly, and an ambiguous command throws instead of being guessed |
 | 7 | `Restart-ServiceProcess` | Stopping by process name could kill a second instance. | High for multi-instance hosts | Resolved for the supervisor: it stops only the one process that carries the config path. The keeper still detects the service by name (row 19) |
 | 8 | Catalog fetch | Windows PowerShell 5.1 may use legacy TLS defaults for `Invoke-WebRequest`. | Medium | Open |
-| 9 | Test coverage | Automated tests cover the priority regressions, the failover write/restore path, an accept/reject table for the JSON tokenizer and the process-identity reasons. Untested: the main loop (top-level script code), `Invoke-GatewayProbe` over TLS, and real process start/stop. | Critical for contributors | Partial |
+| 9 | Test coverage | Automated tests cover the priority regressions, the failover write/restore path, an accept/reject table for the JSON tokenizer and the process-identity reasons. Untested: the main loop (top-level script code), `Invoke-GatewayProbe` end to end over TLS, and real process start/stop (the certificate policy and command-line parsing have unit coverage). | Critical for contributors | Partial |
 | 10 | Logging | Append-only with no rotation, no size cap, no structured format and no counters. | Low to Medium | Open |
 | 11 | Candidate fan-out | Every probe instance starts at once: `maxCandidates = 8` means 8 processes and 8 generated files at peak. | Medium on small hosts | Open |
 | 12 | Mutex granularity | The single-instance mutex is keyed on the service name alone, so two supervisors with different configurations for the same service would exclude each other. | Low | Open |
@@ -57,7 +61,7 @@ which issue references have been closed by code.
 ## Where help is most valuable
 
 1. Review the Pester suite and add cases for remaining failure modes as they are fixed.
-2. Review the remaining open limitations, especially certificate validation, command-line
-   parsing in the restart path, and the write path and measurement time (rows 17 and 18).
+2. Review the remaining open limitations, especially the write path, the measurement time and
+   the keeper detection gap (rows 17, 18 and 19).
 3. The source-span patching decision above is implemented; feedback on its configuration
    compatibility and failure behavior is useful.

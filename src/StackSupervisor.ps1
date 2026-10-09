@@ -513,6 +513,22 @@ function Read-HttpHeaderBlock {
     } finally { $header.Dispose() }
 }
 
+function Get-ProbeCertificateCallback {
+    <#
+        Returns the certificate validation callback a probe connection should use.
+
+        $null means "let SslStream apply the platform check", which is the default. Accepting an
+        untrusted certificate is opt-in, because a probe that accepts anything reports a
+        hijacked endpoint as healthy - a false pass is worse here than a false failure.
+    #>
+    param([switch]$AllowUntrusted)
+    if (-not $AllowUntrusted) { return $null }
+    return [System.Net.Security.RemoteCertificateValidationCallback] {
+        param($sender, $certificate, $chain, $errors)
+        return $true
+    }
+}
+
 function Invoke-GatewayProbe {
     <#
         Sends one request through the local service endpoint and returns the raw response.
@@ -523,7 +539,8 @@ function Invoke-GatewayProbe {
         [Parameter(Mandatory)][int]$LocalPort,
         [Parameter(Mandatory)][string]$Url,
         [int]$TimeoutSec = 12,
-        [switch]$NoTls
+        [switch]$NoTls,
+        [switch]$AllowUntrustedCertificate
     )
     $uri = [System.Uri]$Url
     $client = New-Object System.Net.Sockets.TcpClient
@@ -547,8 +564,12 @@ function Invoke-GatewayProbe {
 
         $active = $stream
         if (-not $NoTls) {
-            $ssl = New-Object System.Net.Security.SslStream($stream, $false,
-                ([System.Net.Security.RemoteCertificateValidationCallback] { $true }))
+            $callback = Get-ProbeCertificateCallback -AllowUntrusted:$AllowUntrustedCertificate
+            if ($callback) {
+                $ssl = New-Object System.Net.Security.SslStream($stream, $false, $callback)
+            } else {
+                $ssl = New-Object System.Net.Security.SslStream($stream, $false)
+            }
             $ssl.AuthenticateAsClient($uri.Host, $null, [System.Security.Authentication.SslProtocols]::Tls12, $false)
             $active = $ssl
         }
@@ -961,15 +982,48 @@ function Invoke-CandidateMeasurement {
 
 #region ------------------------------------------------------------------ service
 
-function Start-ServiceProcess {
-    param([Parameter(Mandatory)]$Config)
-    $command = ([string]$Config.service.startCommand).Replace('{config}', [string]$Config.service.configPath)
-    $parts = [regex]::Match($command, '^\s*"?([^"]+?)"?\s+(.+)$')
-    if ($parts.Success) {
-        Start-Process -FilePath $parts.Groups[1].Value -ArgumentList $parts.Groups[2].Value -WindowStyle Hidden
-    } else {
-        Start-Process -FilePath $command -WindowStyle Hidden
+function ConvertTo-ProcessStartInfo {
+    <#
+        Splits a configured command line into an executable and an argument string.
+
+        A quoted executable is taken verbatim. An unquoted one may not contain whitespace,
+        because guessing where the path ends is exactly how a configured
+        "C:\Program Files\App\svc.exe" becomes FilePath "C:\Program" with an argument string
+        that starts with "Files\App\...", after which the service never starts and nothing is
+        logged. Anything ambiguous throws instead of guessing.
+    #>
+    param([Parameter(Mandatory)][string]$Command)
+    $match = [regex]::Match($Command.Trim(), '^(?:"([^"]+)"|(\S+))(?:\s+([\s\S]+))?$')
+    if (-not $match.Success) { throw ('cannot parse the service start command: ' + $Command) }
+    if ($match.Groups[1].Success) { $file = $match.Groups[1].Value } else { $file = $match.Groups[2].Value }
+    if (-not [System.IO.Path]::IsPathRooted($file)) {
+        throw ('the service start command does not begin with an absolute executable path: ' + $Command)
     }
+    $arguments = ''
+    if ($match.Groups[3].Success) { $arguments = $match.Groups[3].Value }
+    return [pscustomobject]@{ FilePath = $file; Arguments = $arguments }
+}
+
+function Start-ServiceProcess {
+    <#
+        Starts the service. Explicit startExecutable/startArguments win; startCommand is still
+        accepted but has to survive parsing without ambiguity.
+    #>
+    param([Parameter(Mandatory)]$Config)
+    if ($Config.service.PSObject.Properties.Name.Contains('startExecutable') -and $Config.service.startExecutable) {
+        $executable = [string]$Config.service.startExecutable
+        $arguments = ''
+        if ($Config.service.PSObject.Properties.Name.Contains('startArguments') -and $Config.service.startArguments) {
+            $arguments = ([string]$Config.service.startArguments).Replace('{config}', [string]$Config.service.configPath)
+        }
+    } else {
+        $command = ([string]$Config.service.startCommand).Replace('{config}', [string]$Config.service.configPath)
+        $startInfo = ConvertTo-ProcessStartInfo -Command $command
+        $executable = $startInfo.FilePath
+        $arguments = $startInfo.Arguments
+    }
+    Start-Process -FilePath $executable -ArgumentList $arguments -WindowStyle Hidden
+    return $executable
 }
 
 function Get-ServiceProcessSnapshot {
